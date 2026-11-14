@@ -358,6 +358,30 @@ String reverseName(uint32_t ip, IPAddress dns, uint32_t waitMs) {
 #include "OpenWrt.h"
 #include "NetworkSettings.h"
 #include "DevicePolicy.h"
+static bool resolveDeviceHostnames(Device *rows, unsigned count);
+static bool resolveDeviceHostnames(Device *rows, unsigned count) {
+  const IPAddress dns = ETH.dnsIP();
+  const uint32_t localIP = number(ETH.localIP());
+  for (unsigned i = 0; i < count; ++i) {
+    if (!networkReady())
+      return false;
+    Device &device = rows[i];
+    // Legacy discovery can seed a row with a name from its previous address.
+    device.hostname[0] = '\0';
+    if (!device.online || !device.ip)
+      continue;
+    if (device.ip == localIP) {
+      snprintf(device.hostname, sizeof(device.hostname), "%s.local", networkSettings.hostname);
+    } else if (dns != IPAddress()) {
+      const String hostname = reverseName(device.ip, dns, 45);
+      strlcpy(device.hostname, hostname.c_str(), sizeof(device.hostname));
+    }
+    if (scanSource == "local")
+      strlcpy(device.name, device.hostname, sizeof(device.name));
+  }
+  return networkReady();
+}
+
 void scanTask(void *) {
   for (;;) {
     if (!networkReady()) {
@@ -450,8 +474,6 @@ void scanTask(void *) {
           device.online = true;
           if (self)
             strlcpy(device.mac, ETH.macAddress().c_str(), sizeof(device.mac));
-          String name = self ? String(networkSettings.hostname) : reverseName(ip, ETH.dnsIP(), 65);
-          strlcpy(device.name, name.c_str(), sizeof(device.name));
           fresh[count++] = device;
         }
         xSemaphoreTake(lock, portMAX_DELAY);
@@ -460,6 +482,8 @@ void scanTask(void *) {
         vTaskDelay(1);
       }
     }
+    if (!aborted)
+      aborted = !resolveDeviceHostnames(fresh, count);
     Device *oldReport = nullptr;
     xSemaphoreTake(lock, portMAX_DELAY);
     if (!aborted) {
@@ -489,6 +513,10 @@ void scanTask(void *) {
             break;
           }
         }
+        if (!fresh[i].hostname[0] && previous && previous->ip == fresh[i].ip)
+          strlcpy(fresh[i].hostname, previous->hostname, sizeof(fresh[i].hostname));
+        if (scanSource == "local" && !fresh[i].name[0])
+          strlcpy(fresh[i].name, fresh[i].hostname, sizeof(fresh[i].name));
         updateDevice(fresh[i], previous, now, epoch);
       }
       RouterSnapshot history = {fresh, count, capacity, lo, hi};
@@ -634,7 +662,7 @@ void api() {
     auto &d = devices[i];
     char key[13];
     out += "{\"ip\":" + json(d.ip ? address(d.ip).toString() : String("")) +
-           ",\"name\":" + json(d.name) + ",\"mac\":" + json(d.mac) +
+           ",\"name\":" + json(d.name) + ",\"hostname\":" + json(d.hostname) + ",\"mac\":" + json(d.mac) +
            ",\"status\":" + json(d.online ? "ONLINE" : "OFFLINE") +
            ",\"changed\":" + (d.changed ? "true" : "false") +
            ",\"isNew\":" + (d.isNew ? "true" : "false") + ",\"connection\":" + json(d.connection) +
@@ -771,7 +799,58 @@ static void saveConfigurationBackup() {
               saved ? "Configuration saved to internal flash." : "Could not save the configuration backup.");
 }
 
+enum LedState { LedUnauthorized, LedAcknowledged, LedAuthorized, LedActivity, LedStateCount };
+static const char *const ledLabels[] = {"Unauthorized", "Acknowledged", "Authorized / clear", "Scan activity"};
+struct LedSettings {
+  bool enabled = true;
+  bool show[LedStateCount] = {true, true, true, false};
+  uint32_t colors[LedStateCount] = {0xFF0000, 0xFFCA00, 0x00FF00, 0x0080FF};
+};
+static LedSettings leds;
 
+static String ledSettingsSection() {
+  String html = "<section class='card settings-card' id='leds'><h2>LED indicators</h2>"
+                "<p class='helper'>Control the onboard RGB indicator. The Ethernet controller drives LINK and ACT.</p>"
+                "<form id='ledForm'><label class='check'><input type='checkbox' name='enabled' value='yes'";
+  if (leds.enabled)
+    html += " checked";
+  html += ">Enable RGB indicator</label><div class='form-grid'>";
+  for (unsigned i = 0; i < LedStateCount; ++i) {
+    const String index(i);
+    char color[8];
+    snprintf(color, sizeof(color), "#%06lx", static_cast<unsigned long>(leds.colors[i]));
+    html += "<div><label class='check'><input type='checkbox' name='show" + index + "' value='yes'" +
+            (leds.show[i] ? " checked" : "") + ">" + ledLabels[i] + "</label>"
+            "<label class='field'>Color<input type='color' name='color" + index + "' value='" +
+            color + "'></label></div>";
+  }
+  return html + "</div><button class='btn btn-primary' type='submit'>Apply LED settings</button>"
+                "<p id='ledFeedback' role='status'></p></form></section>";
+}
+
+static void saveLedSettings() {
+  if (!adminRequest(true))
+    return;
+  LedSettings next;
+  next.enabled = server.arg("enabled") == "yes";
+  for (unsigned i = 0; i < LedStateCount; ++i) {
+    const String index(i);
+    const String color = server.arg("color" + index);
+    if (color.length() != 7 || color[0] != '#' ||
+        strspn(color.c_str() + 1, "0123456789abcdefABCDEF") != 6) {
+      server.send(400, "text/plain", "Choose a valid color for each indicator.");
+      return;
+    }
+    next.show[i] = server.arg("show" + index) == "yes";
+    next.colors[i] = strtoul(color.c_str() + 1, nullptr, 16);
+  }
+  if (prefs.putBytes("leds-v1", &next, sizeof(next)) != sizeof(next)) {
+    server.send(500, "text/plain", "Could not save LED settings.");
+    return;
+  }
+  leds = next;
+  server.send(200, "text/plain", "LED settings saved.");
+}
 
 void admin() {
   if (!auth())
@@ -783,7 +862,7 @@ void admin() {
   }
   p +=
       String(ADMIN_PAGE_HEAD) +
-      R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark mode</span></button><a class="btn btn-primary" href="/">Back to dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network">Ethernet</a><a href="#access-point">Wi-Fi access point</a><a href="#scan">Scan preferences</a><a href="#router">Router connection</a><a href="#acknowledgment">Acknowledgment</a><a href="#time">Date &amp; time</a><a href="#security">Admin security</a><a href="#configuration-backup">Configuration backup</a><a href="#devices">Device policies</a></nav><div><div class="form-title"><span class="eyebrow">Configuration</span><h2>Monitor settings</h2><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
+      R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark mode</span></button><a class="btn btn-primary" href="/">Back to dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network">Ethernet</a><a href="#access-point">Wi-Fi access point</a><a href="#scan">Scan preferences</a><a href="#router">Router connection</a><a href="#acknowledgment">Acknowledgment</a><a href="#leds">LED indicators</a><a href="#time">Date &amp; time</a><a href="#security">Admin security</a><a href="#configuration-backup">Configuration backup</a><a href="#devices">Device policies</a></nav><div><div class="form-title"><span class="eyebrow">Configuration</span><h2>Monitor settings</h2><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
   p += R"HTML(<section class='card settings-card' id='devices'><div class='section-title'><div>
       <h2>Device policies</h2><p>Manage discovered devices and clear the observed history.</p></div></div>
       <label class='field device-search'>Search devices<input id='deviceSearch' type='search' placeholder='Hostname, IP, MAC, presence or policy'></label>
@@ -808,6 +887,7 @@ void admin() {
         </div>
         <p id='backupStatus' role='status'></p>
       </section>
+      )HTML" + ledSettingsSection() + R"HTML(
       <form method='post' action='/admin' id='settingsForm'><input type='hidden' name='csrf' value=")HTML" +
       csrf +
       R"HTML("><section class='card settings-card' id='network'><h2>Ethernet</h2><div class='form-grid'>)HTML";
@@ -1293,6 +1373,8 @@ void setup() {
   Serial.printf("\nWatchtower - Intrusion Detection System (IDS) (ids-1) starting; reset reason: %d\n",
                 int(esp_reset_reason()));
   prefs.begin("esp32ids", false);
+  if (prefs.getBytesLength("leds-v1") == sizeof(leds))
+    prefs.getBytes("leds-v1", &leds, sizeof(leds));
   adminPassword = prefs.getString("admin", defaultPassword);
   if (!adminPassword.length())
     adminPassword = defaultPassword;
@@ -1385,6 +1467,7 @@ void setup() {
     }
   });
   server.on("/admin/devices", HTTP_POST, changeDevices);
+  server.on("/admin/leds", HTTP_POST, saveLedSettings);
   server.on("/admin/backup", HTTP_POST, saveConfigurationBackup);
   server.on("/admin/backup/restore", HTTP_POST, restoreSettings);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
@@ -1405,14 +1488,14 @@ void setup() {
 }
 static void updateStatusLed() {
   static uint32_t lastUpdate = 0;
-  static uint8_t lastRed = 255, lastGreen = 255;
+  static uint32_t lastColor = UINT32_MAX;
   const uint32_t now = millis();
   if (now - lastUpdate < 40)
     return;
   lastUpdate = now;
 
-  uint8_t red = 0, green = 0;
-  if (networkReady()) {
+  uint32_t color = 0;
+  if (leds.enabled && networkReady()) {
     if (xSemaphoreTake(lock, 0) != pdTRUE)
       return;
     bool unauthorized = false, acknowledged = false;
@@ -1424,18 +1507,16 @@ static void updateStatusLed() {
       unauthorized |= policy == Unknown;
       acknowledged |= policy == Acknowledged;
     }
-    const bool alert = unauthorized || acknowledged;
-    const uint32_t halfPeriod = alert ? 160 : 500;
-    if (completed && (now / halfPeriod) % 2 == 0) {
-      red = alert ? 48 : 0;
-      green = unauthorized ? 0 : acknowledged ? 38 : 40;
-    }
+    const LedState state = unauthorized ? LedUnauthorized : acknowledged ? LedAcknowledged
+        : scanning && leds.show[LedActivity] ? LedActivity : LedAuthorized;
+    const uint32_t halfPeriod = state == LedAuthorized ? 500 : 160;
+    if ((completed || state == LedActivity) && leds.show[state] && (now / halfPeriod) % 2 == 0)
+      color = leds.colors[state];
     xSemaphoreGive(lock);
   }
-  if (red != lastRed || green != lastGreen) {
-    rgbLedWrite(21, red, green, 0);
-    lastRed = red;
-    lastGreen = green;
+  if (color != lastColor) {
+    rgbLedWrite(21, ((color >> 16) & 255) / 5, ((color >> 8) & 255) / 5, (color & 255) / 5);
+    lastColor = color;
   }
 }
 

@@ -17,6 +17,8 @@ A LAN device monitor for the **Waveshare ESP32-S3-ETH**. It uses the layout, the
 
 GL.iNet scans reuse one authenticated SSH connection and open a fresh channel per scan. TCP keepalives help detect a lost connection. Watchtower reconnects on the next scan after a failure and checks the saved SSH host key again.
 
+Both device tables have a sortable, searchable **DNS name** column. Watchtower queries the Ethernet DNS server for reverse DNS (PTR) records for online IPv4 devices. Router aliases and reported device names appear in **Device name**. When a device keeps the same MAC and IP, a previously resolved name can remain visible during a temporary DNS failure.
+
 ## Device policies
 
 **Authorize** adds a MAC to the whitelist and marks it green. **Deauthorize** returns it to Unauthorized. In Admin, select individual devices or use **Select all shown** to select the current search results. Selection stays active across searches and sorting. **Select none** clears it. **Acknowledge** suppresses an online unauthorized device’s red alert for the duration configured in Admin. The default is 15 minutes. Acknowledgments clear on restart or when device history is cleared. **Reset** returns the device to the default Unauthorized status. Dashboard actions open the password-protected Admin Console with the selected device highlighted.
@@ -24,6 +26,10 @@ GL.iNet scans reuse one authenticated SSH connection and open a fresh channel pe
 Policies survive reboots. **Clear All Device History** and **Clear Selected Devices from History** remove observed rows. Connected devices can return on the next scan and saved policies apply again. Up to 254 device rows are kept, prioritizing the current report. A MAC allowlist is a device label and alerting policy. It does not change access permissions on the router. Devices using rotating private MAC addresses may appear as new devices.
 
 The onboard RGB LED flashes red for any online unauthorized device, yellow when all online unauthorized devices have been acknowledged, and green when neither condition is present. It stays off until Ethernet is up and a scan has completed. Use **Acknowledge all online** in Admin or tap the board’s **BOOT** button. Hold BOOT for at least two seconds and release it to reboot. The hardware RESET button reboots directly. The W5500 controls the separate Ethernet LINK indicator.
+
+## LED indicators
+
+Under **Admin → LED indicators**, choose colors and enable each state individually. **Enable RGB indicator** is the master switch. Click **Apply LED settings** to apply and save the changes without a restart. Unauthorized takes priority over Acknowledged, then Scan activity when enabled, then Authorized / clear. Defaults are red, yellow, and green for the three status states, with blue Scan activity disabled by default. The W5500 drives LINK and ACT directly. The internal configuration backup excludes LED preferences, which are saved separately.
 
 ## Network settings
 

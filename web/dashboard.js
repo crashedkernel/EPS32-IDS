@@ -56,7 +56,7 @@
     if (choice === 'online' && v.status !== 'ONLINE' || choice === 'offline' && v.status !== 'OFFLINE' || choice === 'changed' && !v.changed || choice === 'new' && !v.isNew) return false;
     if (choice === 'authorized' && (v.status !== 'ONLINE' || v.policy !== 'Authorized')) return false;
     if (choice === 'unauthorized' && (v.status !== 'ONLINE' || v.policy === 'Authorized')) return false;
-    const text = [v.policy, v.ip, v.name || 'Unknown', v.mac || 'Unknown', v.status, stateText(v), v.changed ? 'changed' : '', v.isNew ? 'new' : ''].join(' ').toLowerCase();
+    const text = [v.policy, v.ip, v.name || 'Unknown', v.hostname, v.mac || 'Unknown', v.status, stateText(v), v.changed ? 'changed' : '', v.isNew ? 'new' : ''].join(' ').toLowerCase();
     return $('search').value.trim().toLowerCase().split(/\s+/).every(term => text.includes(term))
   }
 
@@ -80,6 +80,9 @@
       td.className = 'device-name' + (v.name ? '' : ' unknown');
       td.textContent = v.name || 'Unknown';
       td.title = v.name || 'Unknown';
+      tr.appendChild(td);
+      td = document.createElement('td');
+      td.textContent = v.hostname || '—';
       tr.appendChild(td);
       td = document.createElement('td');
       td.className = 'mono muted';
@@ -128,7 +131,7 @@
       } else td.textContent = 'MAC unavailable';
       tr.append(td);
       tr.setAttribute('role', 'row');
-      for (const [i, label] of ['IP address', 'Hostname', 'MAC address', 'Status', 'Connection', 'Actions'].entries()) {
+      for (const [i, label] of ['IP address', 'Device name', 'DNS name', 'MAC address', 'Status', 'Connection', 'Actions'].entries()) {
         tr.children[i].dataset.label = label;
         tr.children[i].setAttribute('role', 'cell')
       }
@@ -137,7 +140,7 @@
     if (!shown.length) {
       const tr = document.createElement('tr'),
         td = document.createElement('td');
-      td.colSpan = 6;
+      td.colSpan = 7;
       td.className = 'empty';
       const title = document.createElement('strong');
       title.textContent = latest.devices.length ? 'No matching devices' : 'No devices discovered yet';

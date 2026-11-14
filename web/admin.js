@@ -131,6 +131,22 @@
       }
     });
   }
+  $('ledForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      const body = new URLSearchParams(new FormData(form));
+      body.set('csrf', $('settingsForm').elements.csrf.value);
+      const response = await fetch('/admin/leds', {method: 'POST', body});
+      $('ledFeedback').textContent = await response.text();
+    } catch {
+      $('ledFeedback').textContent = 'Could not reach Watchtower.';
+    } finally {
+      button.disabled = false;
+    }
+  });
   $('settingsForm').addEventListener('submit', () => {
     $('saveButton').disabled = true;
     $('saveButton').textContent = 'Saving settings...'

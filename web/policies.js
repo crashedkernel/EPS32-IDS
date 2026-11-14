@@ -80,7 +80,7 @@
       const response = await fetch('/api/devices', {cache: 'no-store'});
       if (!response.ok) throw new Error('Device list unavailable.');
       const report = await response.json();
-      const next = JSON.stringify(report.devices.map(d => [d.mac, d.ip, d.name, d.status, d.policy]));
+      const next = JSON.stringify(report.devices.map(d => [d.mac, d.ip, d.name, d.hostname, d.status, d.policy]));
       if (next === signature) return;
       signature = next;
       rows = report.devices;
@@ -95,7 +95,7 @@
   function render() {
     const terms = search.value.trim().toLowerCase().split(/\s+/);
     const devices = rows.filter(d => {
-      const text = [d.name || 'Unknown', d.ip, d.mac, d.status, d.policy].join(' ').toLowerCase();
+      const text = [d.name || 'Unknown', d.hostname, d.ip, d.mac, d.status, d.policy].join(' ').toLowerCase();
       return terms.every(term => text.includes(term));
     }).sort((a, b) => deviceSort.compare(a, b, sortKey, ascending));
     visibleMacs = devices.filter(device => device.policyAvailable).map(device => device.mac);
@@ -114,8 +114,8 @@
     selectHeader.className = 'selection-column';
     selectHeader.textContent = 'Select';
     header.append(selectHeader);
-    const labels = ['Hostname', 'IP address', 'MAC address', 'Presence', 'Policy', 'Actions'];
-    const keys = ['name', 'ip', 'mac', 'presence', 'policy', 'actions'];
+    const labels = ['Device name', 'DNS name', 'IP address', 'MAC address', 'Presence', 'Policy', 'Actions'];
+    const keys = ['name', 'hostname', 'ip', 'mac', 'presence', 'policy', 'actions'];
     for (const [index, label] of labels.entries()) {
       const th = document.createElement('th');
       th.scope = 'col';
@@ -156,11 +156,11 @@
         });
         selection.append(checkbox);
       }
-      [d.name || 'Unknown', d.ip || '—', d.mac || '—', d.status, d.policy].forEach((value, i) => {
+      [d.name || 'Unknown', d.hostname || '—', d.ip || '—', d.mac || '—', d.status, d.policy].forEach((value, i) => {
         const cell = row.insertCell();
         cell.dataset.label = labels[i];
         cell.textContent = value;
-        if (i === 4) cell.className = d.policy === 'Authorized' ? 'authorized' : 'unauthorized';
+        if (i === 5) cell.className = d.policy === 'Authorized' ? 'authorized' : 'unauthorized';
       });
       const cell = row.insertCell();
       cell.dataset.label = 'Actions';

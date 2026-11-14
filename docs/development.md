@@ -21,8 +21,8 @@ arduino-cli compile \
 
 ## Release checks
 
-1. Load the dashboard by Ethernet IP and through the setup AP. Check the inventory, search, sorting, clock, System Uptime, and Scan now.
+1. Load the dashboard by Ethernet IP and through the setup AP. Check the inventory, search, sorting, DNS names, clock, System Uptime, and Scan now.
 2. Verify that Admin challenges unauthenticated requests. Sign in and open each section from the navigation. At desktop and phone widths, check that no controls or device columns are clipped. Toggle dark mode and text sizing.
-3. On a test system, authorize and deauthorize one device, then exercise bulk selection, acknowledgment, and history clearing. Check the dashboard and RGB state after the next scan.
+3. On a test system, authorize and deauthorize one device, then exercise bulk selection, acknowledgment, and history clearing. Check the dashboard and RGB state after the next scan. Change an indicator color and verify the master switch and per-state toggles. Restart and check that the LED settings persist.
 4. Save a configuration backup, change a test setting, and restore the backup. Confirm the expected restart, saved settings, and retained whitelist.
 5. In GL.iNet mode, verify consecutive scans, disconnect Ethernet briefly, reconnect it, and confirm Watchtower resumes successful scans. Check the router logs to confirm the normal polling interval reuses the SSH login.
