@@ -38,6 +38,18 @@
   document.addEventListener('DOMContentLoaded', () => {
     applyTheme(root.dataset.theme);
     applySize(fontSize);
+    const main = document.querySelector('main');
+    if (main) {
+      const top = document.createElement('button');
+      top.type = 'button';
+      top.className = 'btn back-to-top';
+      top.textContent = '↑ Back to top';
+      top.setAttribute('aria-label', 'Back to top of page');
+      top.addEventListener('click', () => main.scrollTo({
+        top: 0, behavior: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+      }));
+      document.body.append(top);
+    }
     for (const b of document.querySelectorAll('[data-theme-toggle]')) b.addEventListener('click', () => {
       const theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
       try {

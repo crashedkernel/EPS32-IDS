@@ -36,13 +36,12 @@ a.stat{display:block;color:var(--text);transition:border-color .15s,box-shadow .
 a.stat:hover,a.stat.selected{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 #device-inventory{scroll-margin-top:20px}.btn-danger{background:var(--danger);color:var(--surface);border-color:var(--danger)}
 .btn-danger:hover{background:var(--danger-bg);color:var(--danger);border-color:var(--danger)}
-.danger-section{border-color:var(--danger);margin-top:22px}.danger-section .section-index{color:var(--danger);border-color:var(--danger)}
-#resetForm{max-width:480px}
 
 #boardUptime{white-space:nowrap;font-size:1.375rem}
 
 .badge.authorized,.authorized{color:#176b3d;background:#e3f4e9}
 .badge.unauthorized,.unauthorized{color:#a32237;background:#fce8ec}
+.badge.acknowledged,.acknowledged{color:var(--amber);background:var(--amber-bg)}
 [data-theme=dark] .authorized{color:#a6ebbb;background:#173a28}
 [data-theme=dark] .unauthorized{color:#ffafbb;background:#462332}
 .device-actions .btn{min-height:30px;padding:4px 7px;margin:2px}
@@ -75,3 +74,64 @@ a.stat:hover,a.stat.selected{border-color:var(--accent);box-shadow:0 0 0 1px var
 
 .settings-nav{max-height:calc(100dvh - 48px);overflow:auto}
 @media(max-width:760px){.settings-nav{max-height:none;overflow:visible}}
+
+html,body{height:100%;overflow:hidden}
+body{display:flex;flex-direction:column}
+.topbar{flex:none;z-index:20}
+main.shell{flex:1 1 auto;overflow:auto;width:100%;min-height:0;scroll-behavior:smooth}
+.health-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px}
+.health-card{min-width:0;background:var(--surface-alt);border:1px solid var(--line);border-radius:12px;padding:18px}
+.health-card h3{font-size:.8rem;color:var(--muted);font-weight:600}
+.health-value{font-size:1.9rem;line-height:1.2;letter-spacing:-.04em;font-weight:650;margin:10px 0 14px;font-variant-numeric:tabular-nums}
+.health-card progress{display:block;appearance:none;width:100%;height:6px;border:0;border-radius:8px;overflow:hidden;background:var(--line);accent-color:var(--accent)}
+.health-card progress::-webkit-progress-bar{background:var(--line)}
+.health-card progress::-webkit-progress-value{background:var(--accent);border-radius:8px}
+.health-card progress::-moz-progress-bar{background:var(--accent)}
+.health-card p{font-size:.75rem;margin:12px 0 0;overflow-wrap:anywhere}
+.health-card small{display:block;color:var(--muted);font-size:.65rem;line-height:1.5;margin-top:6px}
+#healthError{margin-top:12px;color:var(--danger)}
+@media(max-width:560px){.health-grid{grid-template-columns:1fr}}
+
+.heatmap-card{padding:22px 24px;margin-bottom:22px}
+.heatmap-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.heatmap-heading>span{font-size:.75rem}
+.heatmap-legend{display:flex;flex-wrap:wrap;gap:8px 18px;margin:14px 0;font-size:.7rem;color:var(--muted)}
+.heatmap-legend span{display:flex;align-items:center;gap:6px}
+.heatmap-legend i{width:10px;height:10px;border-radius:3px}
+.device-heatmap{display:grid;grid-template-columns:repeat(auto-fill,minmax(24px,1fr));gap:6px}
+.heat-tile{width:100%;aspect-ratio:1;min-height:24px;border:1px solid #0002;border-radius:5px;transition:transform .12s}
+.heat-tile:hover,.heat-tile:focus-visible{transform:scale(1.16);outline:2px solid var(--text);outline-offset:2px}
+.heat-online{background:#2d9b65}.heat-alert{background:#d34354}.heat-ack{background:#d6a23c}.heat-offline{background:#8592a5}
+.heat-tile.heat-offline{background:repeating-linear-gradient(135deg,#8592a5,#8592a5 4px,#6b788b 4px,#6b788b 6px)}
+#heatmapDetail{margin:14px 0 0;min-height:2.8em;overflow-wrap:anywhere}
+@media(max-width:560px){.heatmap-card{padding:18px}.device-heatmap{gap:5px}}
+
+:root{--scroll-track:#e9eef4;--scroll-thumb:#a5b1c1;--scroll-hover:#77879d}
+:root[data-theme=dark]{--scroll-track:#101b29;--scroll-thumb:#40536b;--scroll-hover:#627b99}
+*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) var(--scroll-track)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--scroll-track)}
+::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border:2px solid var(--scroll-track);border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:var(--scroll-hover)}
+.configuration-title{font-size:1.8rem;line-height:1.2;margin-bottom:8px}
+.back-to-top{position:fixed;bottom:18px;right:24px;z-index:30;box-shadow:0 4px 18px #0003}
+main.shell{padding-bottom:80px}
+
+@media(prefers-reduced-motion:reduce){main.shell{scroll-behavior:auto}.heat-tile{transition:none}}
+@media(max-height:560px){.topbar-inner{min-height:72px;padding-top:10px;padding-bottom:10px}.topbar{max-height:45dvh;overflow:auto}}
+@media(prefers-reduced-motion:reduce){main.shell{scroll-behavior:auto}}
+
+/* Admin shares its width with navigation, so use the inventory's own width. */
+#adminDevices{container-type:inline-size;container-name:admin-inventory}
+@container admin-inventory (max-width:66rem){
+  .device-table{overflow:visible}
+  .device-table table,.device-table thead,.device-table tbody{display:block}
+  .device-table thead tr{display:flex;flex-wrap:wrap;gap:8px;padding:12px;border-bottom:1px solid var(--line)}
+  .device-table th{width:auto;padding:0;border:0;background:none;overflow-wrap:normal}
+  .device-table th button{padding:6px 8px;border:1px solid var(--line);border-radius:6px;white-space:nowrap}
+  .device-table tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:14px;border-bottom:1px solid var(--line)}
+  .device-table td{display:block;min-width:0;padding:0;border:0}
+  .device-table td::before{content:attr(data-label);display:block;font-size:.7rem;color:var(--muted);margin-bottom:3px}
+  .device-table td.empty,.device-table td.device-actions{grid-column:1/-1}
+  .device-table td.empty::before,.device-table td.selection-column:empty{display:none}
+}

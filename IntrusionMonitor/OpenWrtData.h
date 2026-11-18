@@ -1,5 +1,5 @@
 #pragma once
-// Router data interpretation, kept independent of Arduino for fixture tests.
+// Router record parsing and bounded snapshot storage.
 #include "Device.h"
 #include <cJSON.h>
 #include <ctype.h>

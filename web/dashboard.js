@@ -45,6 +45,7 @@
     $('zoneLabel').textContent = 'Time zone: ' + zone + ' / ' + format + '-hour time'
   }
   const stateText = v => v.connection || 'Not reported';
+  const reducedMotion = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   function relative(seconds) {
     seconds = Math.max(0, Math.floor(seconds));
@@ -52,6 +53,9 @@
   }
 
   function matches(v) {
+    const group = $('deviceGroup').value;
+    if (group !== 'all' && (v.status !== (group.startsWith('offline') ? 'OFFLINE' : 'ONLINE') ||
+        group.endsWith('-authorized') && v.policy !== 'Authorized')) return false;
     const choice = $('statusFilter').value;
     if (choice === 'online' && v.status !== 'ONLINE' || choice === 'offline' && v.status !== 'OFFLINE' || choice === 'changed' && !v.changed || choice === 'new' && !v.isNew) return false;
     if (choice === 'authorized' && (v.status !== 'ONLINE' || v.policy !== 'Authorized')) return false;
@@ -60,10 +64,46 @@
     return $('search').value.trim().toLowerCase().split(/\s+/).every(term => text.includes(term))
   }
 
+  function renderHeatmap() {
+    const grid = $('deviceHeatmap');
+    const focused = grid.contains(document.activeElement) ? document.activeElement.dataset.mac : null;
+    grid.replaceChildren();
+    const devices = [...latest.devices].sort((a, b) => deviceSort.compare(a, b, 'ip', true));
+    $('heatmapCount').textContent = devices.length + ' tracked devices';
+    if (!devices.length) {
+      grid.textContent = latest.completed ? 'No devices discovered yet.' : 'Waiting for the first scan.';
+      return;
+    }
+    for (const device of devices) {
+      const online = device.status === 'ONLINE';
+      const state = !online ? 'offline' : device.policy === 'Authorized' ? 'online'
+        : device.policy === 'Acknowledged' ? 'ack' : 'alert';
+      const label = [device.name || device.hostname || 'Unknown device', device.ip || 'IP unavailable',
+        device.mac || 'MAC unavailable', online ? 'Online' : 'Offline', device.policy].join(' · ');
+      const tile = document.createElement('button');
+      tile.type = 'button';
+      tile.className = 'heat-tile heat-' + state;
+      tile.dataset.mac = device.mac || device.ip;
+      tile.title = label;
+      tile.setAttribute('aria-label', label);
+      tile.addEventListener('focus', () => { $('heatmapDetail').textContent = label; });
+      tile.addEventListener('mouseenter', () => { $('heatmapDetail').textContent = label; });
+      tile.addEventListener('click', () => {
+        $('deviceGroup').value = 'all';
+        $('statusFilter').value = 'all';
+        $('search').value = device.mac || device.ip || device.name || '';
+        render();
+        $('device-inventory').scrollIntoView({behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start'});
+      });
+      grid.append(tile);
+      if (focused && focused === tile.dataset.mac) tile.focus({preventScroll: true});
+    }
+  }
+
   function render() {
     if (!latest) return;
     for (const link of document.querySelectorAll('[data-filter]')) {
-      const selected = link.dataset.filter === $('statusFilter').value;
+      const selected = $('deviceGroup').value === 'all' && link.dataset.filter === $('statusFilter').value;
       link.classList.toggle('selected', selected);
       link.setAttribute('aria-current', String(selected))
     }
@@ -99,16 +139,19 @@
       badge.appendChild(document.createTextNode(v.status));
       group.appendChild(badge);
       const policy = document.createElement('span');
-      policy.className = 'badge ' + (v.policy === 'Authorized' ? 'authorized' : 'unauthorized');
+      policy.className = 'badge ' + (v.policy === 'Authorized' ? 'authorized'
+        : v.policy === 'Acknowledged' ? 'acknowledged' : 'unauthorized');
       policy.textContent = v.policy;
       group.appendChild(policy);
-      for (const tag of [v.isNew ? 'New' : v.changed ? 'Changed' : ''])
+      for (const tag of [v.isNew ? 'New' : v.changed ? 'Changed' : '']) {
         if (tag) {
           const label = document.createElement('span');
           label.className = 'change-tag';
           label.textContent = tag;
           group.appendChild(label)
-        } td.appendChild(group);
+        }
+      }
+      td.appendChild(group);
       tr.appendChild(td);
       td = document.createElement('td');
       td.className = 'muted';
@@ -183,13 +226,16 @@
       $('lastTime').textContent = latest.completed ? 'Scan complete' : 'Not scanned yet';
       $('lastDate').textContent = latest.completed ? 'Timestamp available after clock sync' : 'Your first report will appear here'
     }
+    $('nextScan').textContent = !latest.ethernetIP ? 'Waiting for Ethernet'
+      : latest.scanning || latest.scanRequested ? 'Scanning'
+      : 'Next scan in ' + Math.max(0, Math.ceil(latest.nextScanSeconds - elapsed)) + ' sec';
     $('scanAge').textContent = latest.completed ? 'Completed ' + relative(latest.age + elapsed) : 'Waiting for first scan'
   }
 
   function scanButton() {
     const scanning = latest && (latest.scanning || latest.scanRequested);
     $('scanNow').disabled = !latest || scanning || requesting;
-    $('scanButtonLabel').textContent = scanning ? 'Scanning...' : requesting ? 'Starting...' : 'Scan now';
+    $('scanButtonLabel').textContent = scanning ? 'Scanning…' : requesting ? 'Starting…' : 'Scan now';
     $('scanIcon').classList.toggle('spinner', Boolean(scanning || requesting))
   }
   async function refresh() {
@@ -226,10 +272,11 @@
       $('refreshInfo').textContent = 'Scans every ' + d.interval + 's / page updates every 5s';
       clockTick();
       scanButton();
+      renderHeatmap();
       render()
     } catch (e) {
       $('error').hidden = false;
-      $('error').textContent = e.message || 'Monitor unreachable. Retrying...';
+      $('error').textContent = e.message || 'Monitor unreachable. Retrying…';
       $('summary').textContent = 'Connection interrupted';
       $('scanState').className = 'badge offline'
     } finally {
@@ -238,14 +285,16 @@
   }
   for (const link of document.querySelectorAll('[data-filter]')) link.addEventListener('click', event => {
     event.preventDefault();
+    $('deviceGroup').value = 'all';
     $('statusFilter').value = link.dataset.filter;
     $('search').value = '';
     render();
     $('device-inventory').scrollIntoView({
-      behavior: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+      behavior: reducedMotion() ? 'auto' : 'smooth',
       block: 'start'
     })
   });
+  $('deviceGroup').addEventListener('change', render);
   $('search').addEventListener('input', render);
   $('statusFilter').addEventListener('change', render);
   $('clearSearch').addEventListener('click', () => {

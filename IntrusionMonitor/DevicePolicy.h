@@ -17,10 +17,11 @@ static bool macKey(const char *mac, char key[13]) {
   if (strlen(mac) != 17)
     return false;
   for (unsigned i = 0; i < 6; i++) {
-    if (!isxdigit(mac[3 * i]) || !isxdigit(mac[3 * i + 1]) || (i < 5 && mac[3 * i + 2] != ':'))
+    if (!isxdigit(static_cast<unsigned char>(mac[3 * i])) ||
+        !isxdigit(static_cast<unsigned char>(mac[3 * i + 1])) || (i < 5 && mac[3 * i + 2] != ':'))
       return false;
-    key[2 * i] = tolower(mac[3 * i]);
-    key[2 * i + 1] = tolower(mac[3 * i + 1]);
+    key[2 * i] = tolower(static_cast<unsigned char>(mac[3 * i]));
+    key[2 * i + 1] = tolower(static_cast<unsigned char>(mac[3 * i + 1]));
   }
   key[12] = 0;
   const char *hex = "0123456789abcdef";

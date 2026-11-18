@@ -1,4 +1,5 @@
 (() => {
+  'use strict';
   const panel = document.getElementById('adminDevices');
   const feedback = document.getElementById('deviceFeedback');
   const search = document.getElementById('deviceSearch');
@@ -32,6 +33,7 @@
   }
   let busy = false;
   let signature = '';
+  let refreshing = false;
 
   async function update(action, mac = '') {
     if (busy) return;
@@ -76,11 +78,14 @@
   }
 
   async function refresh() {
+    if (busy || refreshing) return;
+    refreshing = true;
     try {
       const response = await fetch('/api/devices', {cache: 'no-store'});
       if (!response.ok) throw new Error('Device list unavailable.');
       const report = await response.json();
-      const next = JSON.stringify(report.devices.map(d => [d.mac, d.ip, d.name, d.hostname, d.status, d.policy]));
+      if (busy) return;
+      const next = JSON.stringify(report.devices.map(d => [d.mac, d.ip, d.name, d.hostname, d.status, d.policy, d.policyAvailable, d.canAcknowledge]));
       if (next === signature) return;
       signature = next;
       rows = report.devices;
@@ -89,12 +94,17 @@
       render();
     } catch (error) {
       feedback.textContent = error.message;
+    } finally {
+      refreshing = false;
     }
   }
 
   function render() {
     const terms = search.value.trim().toLowerCase().split(/\s+/);
+    const group = document.getElementById('adminDeviceGroup').value;
     const devices = rows.filter(d => {
+      if (group !== 'all' && (d.status !== (group.startsWith('offline') ? 'OFFLINE' : 'ONLINE') ||
+          group.endsWith('-authorized') && d.policy !== 'Authorized')) return false;
       const text = [d.name || 'Unknown', d.hostname, d.ip, d.mac, d.status, d.policy].join(' ').toLowerCase();
       return terms.every(term => text.includes(term));
     }).sort((a, b) => deviceSort.compare(a, b, sortKey, ascending));
@@ -160,7 +170,8 @@
         const cell = row.insertCell();
         cell.dataset.label = labels[i];
         cell.textContent = value;
-        if (i === 5) cell.className = d.policy === 'Authorized' ? 'authorized' : 'unauthorized';
+        if (i === 5) cell.className = d.policy === 'Authorized' ? 'authorized'
+          : d.policy === 'Acknowledged' ? 'acknowledged' : 'unauthorized';
       });
       const cell = row.insertCell();
       cell.dataset.label = 'Actions';
@@ -172,7 +183,7 @@
       const actions = d.policy === 'Authorized'
         ? [['reset', 'Deauthorize']]
         : [['allow', 'Authorize'], ['acknowledge', 'Acknowledge']];
-      if (d.policy === 'Acknowledged') actions.push(['reset', 'Clear policy']);
+      if (d.policy === 'Acknowledged') actions.push(['reset', 'Clear acknowledgment']);
       for (const [action, label] of actions) {
         if (action === 'acknowledge' && !d.canAcknowledge) continue;
         const button = document.createElement('button');
@@ -208,6 +219,7 @@
       updateSelected('clear-device');
   });
   document.getElementById('acknowledgeAllDevices').addEventListener('click', () => update('acknowledge-all'));
+  document.getElementById('adminDeviceGroup').addEventListener('change', render);
   search.addEventListener('input', render);
   document.getElementById('clearDevices').addEventListener('click', () => {
     if (confirm('Clear all device history? The whitelist is kept.')) update('clear');

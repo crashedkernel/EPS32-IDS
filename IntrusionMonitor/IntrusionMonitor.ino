@@ -10,6 +10,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <nvs.h>
 #include <ETH.h>
 #include <esp_netif_net_stack.h>
 #include <SPI.h>
@@ -60,6 +61,7 @@ uint64_t utcNow() {
   time_t now = time(nullptr);
   return clockHasSync.load() && now >= 1700000000 ? uint64_t(now) : 0;
 }
+std::atomic<uint32_t> nextScanAt{0};
 uint32_t lastScan = 0, restartAt = 0, scanNumber = 0;
 String scanError;
 
@@ -69,7 +71,7 @@ uint32_t number(IPAddress ip) {
 IPAddress address(uint32_t n) { return IPAddress(n >> 24, n >> 16, n >> 8, n); }
 bool parseIP(String s, uint32_t &n) {
   IPAddress a;
-  if (!a.fromString(s))
+  if (!a.fromString(s) || a.type() != IPv4)
     return false;
   n = number(a);
   return true;
@@ -366,15 +368,29 @@ static bool resolveDeviceHostnames(Device *rows, unsigned count) {
     if (!networkReady())
       return false;
     Device &device = rows[i];
-    // Legacy discovery can seed a row with a name from its previous address.
     device.hostname[0] = '\0';
+    device.dnsCheckedAt = 0;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    for (unsigned j = 0; j < deviceCount; ++j) {
+      if (sameDevice(device, devices[j]) && device.ip == devices[j].ip) {
+        strlcpy(device.hostname, devices[j].hostname, sizeof(device.hostname));
+        device.dnsCheckedAt = devices[j].dnsCheckedAt;
+        break;
+      }
+    }
+    xSemaphoreGive(lock);
     if (!device.online || !device.ip)
       continue;
+    const uint32_t now = uptimeSeconds();
     if (device.ip == localIP) {
       snprintf(device.hostname, sizeof(device.hostname), "%s.local", networkSettings.hostname);
-    } else if (dns != IPAddress()) {
+    } else if (dns != IPAddress() &&
+               (!device.dnsCheckedAt ||
+                now - device.dnsCheckedAt >= (device.hostname[0] ? 300U : 60U))) {
       const String hostname = reverseName(device.ip, dns, 45);
-      strlcpy(device.hostname, hostname.c_str(), sizeof(device.hostname));
+      if (hostname.length())
+        strlcpy(device.hostname, hostname.c_str(), sizeof(device.hostname));
+      device.dnsCheckedAt = now ? now : 1;
     }
     if (scanSource == "local")
       strlcpy(device.name, device.hostname, sizeof(device.name));
@@ -401,6 +417,7 @@ void scanTask(void *) {
       continue;
     }
     xSemaphoreTake(lock, portMAX_DELAY);
+    nextScanAt.store(0);
     scanning = true;
     scanRequested = false;
     ulTaskNotifyTake(pdTRUE, 0);
@@ -552,6 +569,7 @@ void scanTask(void *) {
     uint32_t elapsed = millis() - began;
     uint32_t interval = scanIntervalSeconds * 1000UL;
     const uint32_t wait = elapsed < interval ? interval - elapsed : 250;
+    nextScanAt.store(millis() + wait);
     const uint32_t waitStarted = millis();
     const uint32_t generation = ethernetLinkGeneration.load();
     while (millis() - waitStarted < wait) {
@@ -610,31 +628,44 @@ void forceScan() {
   server.send(202, "application/json", "{\"status\":\"requested\"}");
 }
 void api() {
+  static Device *snapshot = nullptr;
+  if (!snapshot)
+    snapshot = new (std::nothrow) Device[MAX_HOSTS];
+  if (!snapshot) {
+    server.send(503, "text/plain", "Not enough memory for the device report.");
+    return;
+  }
   String out;
   if (!out.reserve(1400)) {
     server.send(503, "text/plain", "Monitor busy; retry shortly.");
     return;
   }
-  server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
-  xSemaphoreTake(lock, portMAX_DELAY);
+  if (xSemaphoreTake(lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    server.send(503, "text/plain", "Scan busy. Retry shortly.");
+    return;
+  }
+  const unsigned snapshotCount = deviceCount;
+  if (snapshotCount)
+    memcpy(snapshot, devices, snapshotCount * sizeof(Device));
   unsigned onlineCount = 0, offlineCount = 0, newCount = 0, changedCount = 0;
-  for (unsigned i = 0; i < deviceCount; i++) {
-    if (devices[i].online)
+  for (unsigned i = 0; i < snapshotCount; i++) {
+    if (snapshot[i].online)
       onlineCount++;
     else
       offlineCount++;
-    if (devices[i].isNew)
+    if (snapshot[i].isNew)
       newCount++;
-    if (devices[i].changed)
+    if (snapshot[i].changed)
       changedCount++;
   }
   uint64_t now = utcNow();
   uint64_t scanned = lastScanEpoch;
   if (completed && !scanned && now)
     scanned = now - (millis() - lastScan) / 1000;
-  out += "{\"firmware\":\"ids-1\",\"nowEpoch\":" + String(now) +
+  out += "{\"nextScanSeconds\":" +
+         String(nextScanAt.load() ? max(int32_t(0), int32_t(nextScanAt.load() - millis())) / 1000
+                                  : 0) +
+         ",\"firmware\":\"ids-1\",\"nowEpoch\":" + String(now) +
          ",\"uptimeSeconds\":" + String(uint64_t(esp_timer_get_time()) / 1000000ULL) +
          ",\"timeZone\":" + json(timeZone) + ",\"timeFormat\":" + json(timeFormat) +
          ",\"timeServer\":" + json(timeServer) + ",\"scanNumber\":" + String(scanNumber) +
@@ -642,8 +673,8 @@ void api() {
          ",\"scanToken\":" + json(csrf) +
          ",\"scanRequested\":" + (scanRequested ? "true" : "false") +
          ",\"clientMode\":" + String(scanSource == "glinet" ? "true" : "false") +
-         ",\"source\":" + json(scanSource) + ",\"ethernetIP\":" +
-         json(networkReady() ? ETH.localIP().toString() : String("")) +
+         ",\"source\":" + json(scanSource) +
+         ",\"ethernetIP\":" + json(networkReady() ? ETH.localIP().toString() : String("")) +
          ",\"interval\":" + scanIntervalSeconds + ",\"online\":" + onlineCount +
          ",\"offline\":" + offlineCount + ",\"newDevices\":" + newCount +
          ",\"changedDevices\":" + changedCount +
@@ -651,19 +682,24 @@ void api() {
          ",\"completed\":" + (completed ? "true" : "false") + ",\"progress\":" + progress +
          ",\"age\":" + ((millis() - lastScan) / 1000) + ",\"error\":" + json(scanError) +
          ",\"ethernetStarted\":" + (ethernetStarted ? "true" : "false") +
-         ",\"hostname\":" + json(networkSettings.hostname) + ",\"apName\":" +
-         json(networkSettings.apName) + ",\"ethernetMac\":" +
-         json(ethernetStarted ? ETH.macAddress() : String("")) + ",\"devices\":[";
+         ",\"hostname\":" + json(networkSettings.hostname) +
+         ",\"apName\":" + json(networkSettings.apName) +
+         ",\"ethernetMac\":" + json(ethernetStarted ? ETH.macAddress() : String("")) +
+         ",\"devices\":[";
+  xSemaphoreGive(lock);
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
   server.sendContent(out);
-  for (unsigned i = 0; i < deviceCount; i++) {
+  for (unsigned i = 0; i < snapshotCount; i++) {
     out = "";
     if (i)
       out += ',';
-    auto &d = devices[i];
+    auto &d = snapshot[i];
     char key[13];
     out += "{\"ip\":" + json(d.ip ? address(d.ip).toString() : String("")) +
-           ",\"name\":" + json(d.name) + ",\"hostname\":" + json(d.hostname) + ",\"mac\":" + json(d.mac) +
-           ",\"status\":" + json(d.online ? "ONLINE" : "OFFLINE") +
+           ",\"name\":" + json(d.name) + ",\"hostname\":" + json(d.hostname) +
+           ",\"mac\":" + json(d.mac) + ",\"status\":" + json(d.online ? "ONLINE" : "OFFLINE") +
            ",\"changed\":" + (d.changed ? "true" : "false") +
            ",\"isNew\":" + (d.isNew ? "true" : "false") + ",\"connection\":" + json(d.connection) +
            ",\"policy\":" + json(policyNames[effectivePolicy(d, uptimeSeconds())]) +
@@ -671,13 +707,17 @@ void api() {
            ",\"policyAvailable\":" + (macKey(d.mac, key) ? "true" : "false") +
            ",\"lastSeen\":" + d.lastSeenEpoch +
            ",\"sessionSource\":" + json(d.hasRouterSession ? "router" : "estimated") +
-           ",\"session\":" + (d.hasRouterSession
-               ? uint64_t(d.routerSession) + (d.online ? uptimeSeconds() - d.lastSeen : 0)
-               : uint64_t((d.online ? uptimeSeconds() : d.lastSeen) - d.connectedAt)) + "}";
+           ",\"session\":" +
+           (d.hasRouterSession
+                ? uint64_t(d.routerSession) + (d.online ? uptimeSeconds() - d.lastSeen : 0)
+                : uint64_t((d.online ? uptimeSeconds() : d.lastSeen) - d.connectedAt)) +
+           "}";
+    if (!server.client().connected())
+      break;
     server.sendContent(out);
+    delay(1);
   }
   out = "]}";
-  xSemaphoreGive(lock);
   server.sendContent(out);
   server.sendContent("");
 }
@@ -691,15 +731,19 @@ void changeDevices() {
   const String action = server.arg("action");
   if (action == "acknowledge-all") {
     const unsigned count = acknowledgeOnlineDevices();
-    server.send(200, "text/plain", String(count) + " device(s) acknowledged for " + ackMinutes + " minutes.");
+    server.send(200, "text/plain",
+                String(count) + " device(s) acknowledged for " + ackMinutes + " minutes.");
     return;
   }
   const String mac = server.arg("mac");
-  const Policy policy = action == "allow" ? Allowed : action == "acknowledge" ? Acknowledged : Unknown;
+  const Policy policy = action == "allow"         ? Allowed
+                        : action == "acknowledge" ? Acknowledged
+                                                  : Unknown;
   char key[13];
   const bool clear = action == "clear";
   const bool clearDevice = action == "clear-device";
-  if (!clear && ((policy == Unknown && action != "reset" && !clearDevice) || !macKey(mac.c_str(), key))) {
+  if (!clear &&
+      ((policy == Unknown && action != "reset" && !clearDevice) || !macKey(mac.c_str(), key))) {
     server.send(400, "text/plain", "Choose a device with a valid MAC address.");
     return;
   }
@@ -727,7 +771,8 @@ void changeDevices() {
     server.send(409, "text/plain", "Acknowledge an online unauthorized device.");
     return;
   }
-  server.send(saved ? 200 : 500, "text/plain", saved ? "Saved" : "Could not save the device policy.");
+  server.send(saved ? 200 : 500, "text/plain",
+              saved ? "Saved" : "Could not save the device policy.");
 }
 String field(String label, String name, String value, String type = "text") {
   return "<label class='field'>" + label + "<input name='" + name + "' type='" + type +
@@ -736,7 +781,8 @@ String field(String label, String name, String value, String type = "text") {
 }
 String timeSettingsFields() {
   String p =
-      "<section class='card settings-card' id='time'><div class='section-title'><div><h2>Date &amp; time</h2><p>Choose the clock shown to "
+      "<section class='card settings-card' id='time'><div class='section-title'><div><h2>Date "
+      "&amp; time</h2><p>Choose the clock shown to "
       "everyone viewing the dashboard.</p></div></div><div class='form-grid'><label "
       "class='field'>Time zone<select name='timeZone' id='timeZone'><option selected value='" +
       escape(timeZone) + "'>" + escape(timeZone) +
@@ -775,6 +821,8 @@ static bool adminRequest(bool write = false) {
   return true;
 }
 
+#include "Health.h"
+
 static void saveConfigurationBackup() {
   if (!adminRequest(true))
     return;
@@ -782,25 +830,32 @@ static void saveConfigurationBackup() {
     server.send(409, "text/plain", "Wait for the restart to finish.");
     return;
   }
-  const String data = String("{\n  \"version\": 1,\n  \"hostname\": ") + json(networkSettings.hostname) +
+  const String data =
+      String("{\n  \"version\": 1,\n  \"hostname\": ") + json(networkSettings.hostname) +
       ",\n  \"ethernet\": {\"mode\": " + json(networkSettings.staticIP ? "static" : "dhcp") +
       ", \"ip\": " + json(networkSettings.ip) + ", \"mask\": " + json(networkSettings.mask) +
-      ", \"gateway\": " + json(networkSettings.gateway) + ", \"dns\": " + json(networkSettings.dns) +
-      "},\n  \"accessPoint\": {\"ssid\": " + json(networkSettings.apName) + ", \"channel\": " + apChannel + ", \"widthMHz\": " + apWidth + ", \"enabledAtBoot\": " + (apStartsOnBoot ? "true" : "false") + "},\n  \"discovery\": {\"source\": " +
-      json(scanSource) + ", \"mode\": " + json(mode) + ", \"subnet\": " + json(subnet) +
-      ", \"start\": " + json(rangeStart) + ", \"end\": " + json(rangeEnd) +
-      ", \"intervalSeconds\": " + scanIntervalSeconds + "},\n  \"router\": {\"ip\": " +
-      json(routerIP) + ", \"port\": " + routerPort + ", \"transport\": " + json(routerTransport) +
-      ", \"username\": " + json(routerUser) + "},\n  \"time\": {\"zone\": " + json(timeZone) +
-      ", \"format\": " + json(timeFormat) + ", \"server\": " + json(timeServer) +
-      "},\n  \"acknowledgmentMinutes\": " + ackMinutes + "\n}\n";
+      ", \"gateway\": " + json(networkSettings.gateway) +
+      ", \"dns\": " + json(networkSettings.dns) +
+      "},\n  \"accessPoint\": {\"ssid\": " + json(networkSettings.apName) +
+      ", \"channel\": " + apChannel + ", \"widthMHz\": " + apWidth +
+      ", \"enabledAtBoot\": " + (apStartsOnBoot ? "true" : "false") +
+      "},\n  \"discovery\": {\"source\": " + json(scanSource) + ", \"mode\": " + json(mode) +
+      ", \"subnet\": " + json(subnet) + ", \"start\": " + json(rangeStart) +
+      ", \"end\": " + json(rangeEnd) + ", \"intervalSeconds\": " + scanIntervalSeconds +
+      "},\n  \"router\": {\"ip\": " + json(routerIP) + ", \"port\": " + routerPort +
+      ", \"transport\": " + json(routerTransport) + ", \"username\": " + json(routerUser) +
+      "},\n  \"time\": {\"zone\": " + json(timeZone) + ", \"format\": " + json(timeFormat) +
+      ", \"server\": " + json(timeServer) + "},\n  \"acknowledgmentMinutes\": " + ackMinutes +
+      "\n}\n";
   const bool saved = prefs.putString("configBackup", data) == data.length();
   server.send(saved ? 200 : 500, "text/plain",
-              saved ? "Configuration saved to internal flash." : "Could not save the configuration backup.");
+              saved ? "Configuration saved to internal flash."
+                    : "Could not save the configuration backup.");
 }
 
 enum LedState { LedUnauthorized, LedAcknowledged, LedAuthorized, LedActivity, LedStateCount };
-static const char *const ledLabels[] = {"Unauthorized", "Acknowledged", "Authorized / clear", "Scan activity"};
+static const char *const ledLabels[] = {"Unauthorized", "Acknowledged", "Authorized / clear",
+                                        "Scan activity"};
 struct LedSettings {
   bool enabled = true;
   bool show[LedStateCount] = {true, true, true, false};
@@ -810,8 +865,11 @@ static LedSettings leds;
 
 static String ledSettingsSection() {
   String html = "<section class='card settings-card' id='leds'><h2>LED indicators</h2>"
-                "<p class='helper'>Control the onboard RGB indicator. The Ethernet controller drives LINK and ACT.</p>"
-                "<form id='ledForm'><label class='check'><input type='checkbox' name='enabled' value='yes'";
+                "<p class='helper'>Control the onboard RGB indicator. The Ethernet controller "
+                "drives LINK and ACT.</p>"
+                "<button type='button' class='btn' id='stealthMode'>Toggle Stealth Mode</button><p "
+                "id='stealthFeedback' role='status'></p><form id='ledForm'><label "
+                "class='check'><input type='checkbox' name='enabled' value='yes'";
   if (leds.enabled)
     html += " checked";
   html += ">Enable RGB indicator</label><div class='form-grid'>";
@@ -819,10 +877,11 @@ static String ledSettingsSection() {
     const String index(i);
     char color[8];
     snprintf(color, sizeof(color), "#%06lx", static_cast<unsigned long>(leds.colors[i]));
-    html += "<div><label class='check'><input type='checkbox' name='show" + index + "' value='yes'" +
-            (leds.show[i] ? " checked" : "") + ">" + ledLabels[i] + "</label>"
-            "<label class='field'>Color<input type='color' name='color" + index + "' value='" +
-            color + "'></label></div>";
+    html += "<div><label class='check'><input type='checkbox' name='show" + index +
+            "' value='yes'" + (leds.show[i] ? " checked" : "") + ">" + ledLabels[i] +
+            "</label>"
+            "<label class='field'>Color<input type='color' name='color" +
+            index + "' value='" + color + "'></label></div>";
   }
   return html + "</div><button class='btn btn-primary' type='submit'>Apply LED settings</button>"
                 "<p id='ledFeedback' role='status'></p></form></section>";
@@ -861,10 +920,15 @@ void admin() {
     return;
   }
   p +=
-      String(ADMIN_PAGE_HEAD) +
-      R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark mode</span></button><a class="btn btn-primary" href="/">Back to dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network">Ethernet</a><a href="#access-point">Wi-Fi access point</a><a href="#scan">Scan preferences</a><a href="#router">Router connection</a><a href="#acknowledgment">Acknowledgment</a><a href="#leds">LED indicators</a><a href="#time">Date &amp; time</a><a href="#security">Admin security</a><a href="#configuration-backup">Configuration backup</a><a href="#devices">Device policies</a></nav><div><div class="form-title"><span class="eyebrow">Configuration</span><h2>Monitor settings</h2><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
-  p += R"HTML(<section class='card settings-card' id='devices'><div class='section-title'><div>
+      String(ADMIN_PAGE_HEAD) + R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark mode</span></button><a class="btn btn-primary" href="/">Back to dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network">Ethernet</a><a href="#access-point">Wi-Fi access point</a><a href="#scan">Scan preferences</a><a href="#router">Router connection</a><a href="#acknowledgment">Acknowledgment</a><a href="#health">Health Status</a><a href="#leds">LED indicators</a><a href="#time">Date &amp; time</a><a href="#security">Admin security</a><a href="#configuration-backup">Configuration backup</a><a href="#devices">Device policies</a></nav><div><button type="button" id="rebootSystem" class="btn btn-danger">Reboot system</button><p id="rebootFeedback" role="status"></p><div class="form-title"><h2 class="configuration-title">Configuration</h2><p class="muted">Monitor settings</p><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
+  p +=
+      R"HTML(<section class='card settings-card' id='devices'><div class='section-title'><div>
       <h2>Device policies</h2><p>Manage discovered devices and clear the observed history.</p></div></div>
+      <label class='field'>Device group<select id='adminDeviceGroup'>
+        <option value='all'>All devices</option><option value='online'>Online</option>
+        <option value='online-authorized'>Online authorized</option><option value='offline'>Offline</option>
+        <option value='offline-authorized'>Offline authorized</option>
+      </select></label>
       <label class='field device-search'>Search devices<input id='deviceSearch' type='search' placeholder='Hostname, IP, MAC, presence or policy'></label>
       <div class='device-selection'>
         <button type='button' id='selectAllDevices' class='btn' disabled>Select all shown</button>
@@ -874,10 +938,16 @@ void admin() {
         <button type='button' id='clearSelectedDevices' class='btn btn-danger' disabled>Clear Selected Devices from History</button>
         <span id='deviceSelectionCount' role='status'>0 selected</span>
       </div>
-      <div id='adminDevices' data-token=')HTML" + csrf + R"HTML('></div>
+      <div id='adminDevices' data-token=')HTML" +
+      csrf + R"HTML('></div>
       <button type='button' id='acknowledgeAllDevices' class='btn btn-primary'>Acknowledge all online</button>
       <button type='button' id='clearDevices' class='btn btn-danger'>Clear All Device History</button>
       <p id='deviceFeedback' class='helper' role='status'></p></section>
+      <section class='card settings-card' id='health'><h2>Health Status</h2>
+        <div id='healthStatus' class='health-grid' aria-label='System resource usage'>
+          <p class='helper'>Loading health information</p>
+        </div><p id='healthError' class='helper' role='status' hidden></p>
+      </section>
       <section class='card settings-card' id='configuration-backup'>
         <h2>Configuration backup</h2>
         <p class='helper'>Save the active settings to internal flash. Each backup replaces the previous one. Passwords and device policies are excluded.</p>
@@ -887,7 +957,8 @@ void admin() {
         </div>
         <p id='backupStatus' role='status'></p>
       </section>
-      )HTML" + ledSettingsSection() + R"HTML(
+      )HTML" +
+      ledSettingsSection() + R"HTML(
       <form method='post' action='/admin' id='settingsForm'><input type='hidden' name='csrf' value=")HTML" +
       csrf +
       R"HTML("><section class='card settings-card' id='network'><h2>Ethernet</h2><div class='form-grid'>)HTML";
@@ -896,9 +967,11 @@ void admin() {
        escape(ethernetStarted ? ETH.macAddress() : String("Unavailable")) + "</code></div>" +
        "<label class='field'>IP assignment<select name='ipMode' id='ipMode'><option value='dhcp'" +
        String(networkSettings.staticIP ? "" : " selected") +
-       ">DHCP</option><option value='static'" + String(networkSettings.staticIP ? " selected" : "") +
+       ">DHCP</option><option value='static'" +
+       String(networkSettings.staticIP ? " selected" : "") +
        ">Static IPv4</option></select></label></div>";
-  p += "<div id='staticFields' class='form-grid'>" + field("IPv4 address", "ethIP", networkSettings.ip) +
+  p += "<div id='staticFields' class='form-grid'>" +
+       field("IPv4 address", "ethIP", networkSettings.ip) +
        field("Subnet mask", "ethMask", networkSettings.mask) +
        field("Default gateway", "ethGateway", networkSettings.gateway) +
        field("DNS server", "ethDNS", networkSettings.dns) +
@@ -914,16 +987,23 @@ void admin() {
          ">" + channel + " — " + (2407 + 5 * channel) + " MHz</option>";
   }
   p += "</select></label><label class='field'>Channel width<select id='apWidth' name='apWidth'>"
-       "<option value='20'" + String(apWidth == 20 ? " selected" : "") + ">20 MHz</option>"
-       "<option value='40'" + String(apWidth == 40 ? " selected" : "") + ">40 MHz</option>"
+       "<option value='20'" +
+       String(apWidth == 20 ? " selected" : "") +
+       ">20 MHz</option>"
+       "<option value='40'" +
+       String(apWidth == 40 ? " selected" : "") +
+       ">40 MHz</option>"
        "</select></label></div><p class='helper'>Leave the password blank to keep it. "
        "Use 8–63 printable ASCII characters. Manage the AP over Ethernet to stay connected.</p>"
-       "<div class='device-selection'><button type='button' class='btn' id='apStart'>Start AP</button>"
+       "<div class='device-selection'><button type='button' class='btn' id='apStart'>Start "
+       "AP</button>"
        "<button type='button' class='btn' id='apStop'>Stop AP</button>"
-       "<button type='button' class='btn btn-primary' id='apRestart'>Save and restart AP</button></div>"
+       "<button type='button' class='btn btn-primary' id='apRestart'>Save and restart "
+       "AP</button></div>"
        "<button type='button' class='btn' id='apPersistent' data-enabled='" +
        String(apStartsOnBoot ? "true'>Disable AP persistently" : "false'>Enable AP persistently") +
-       "</button><p id='apStatus' role='status'>" + String(apRunning ? "Running" : "Stopped") + "</p>" +
+       "</button><p id='apStatus' role='status'>" + String(apRunning ? "Running" : "Stopped") +
+       "</p>" +
        "</section><section class='card settings-card' "
        "id='scan'><div class='section-title'><div><h2>Scan preferences</h2><p>Choose "
        "where to look for devices and how often to update.</p></div></div><div "
@@ -984,7 +1064,9 @@ void admin() {
        "router</label></details></section>" +
        "<section class='card settings-card' id='acknowledgment'><h2>Acknowledgment</h2>" +
        field("Suppress alerts for (minutes)", "ackMinutes", String(ackMinutes), "number") +
-       "<p class='helper'>Use 1–10080 minutes. Tap BOOT to acknowledge all online unauthorized devices. Hold BOOT for two seconds to restart. Acknowledgments clear on restart.</p></section>" +
+       "<p class='helper'>Use 1–10080 minutes. Tap BOOT to acknowledge all online unauthorized "
+       "devices. Hold BOOT for two seconds to restart. Acknowledgments clear on "
+       "restart.</p></section>" +
        timeSettingsFields() +
        "<section class='card settings-card' "
        "id='security'><div class='section-title'><div><h2>Admin security</h2><p>Update "
@@ -998,8 +1080,11 @@ void admin() {
        "monitor and clears observed sessions. Saved device policies are kept.</p><button "
        "type='submit' class='btn btn-primary' id='saveButton'>Save settings "
        "&amp; restart</button></div></form>";
-  p += "</div></div><footer class='page-footer'><span>Watchtower - Intrusion Detection System (IDS) / Administration</span>"
-       "</footer></main><script defer src='/assets/sort.js'></script><script defer src='/assets/admin.js'></script><script defer src='/assets/policies.js'></script></body></html>";
+  p += "</div></div><footer class='page-footer'><span>Watchtower - Intrusion Detection System "
+       "(IDS) / Administration</span>"
+       "</footer></main><script defer src='/assets/sort.js'></script><script defer "
+       "src='/assets/admin.js'></script><script defer "
+       "src='/assets/policies.js'></script></body></html>";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html; charset=utf-8", p);
 }
@@ -1009,7 +1094,8 @@ static bool validApChannel(const String &value) {
 }
 
 static bool updateApSettings(NetworkSettings &settings, const String &name, const String &password);
-static bool updateApSettings(NetworkSettings &settings, const String &name, const String &password) {
+static bool updateApSettings(NetworkSettings &settings, const String &name,
+                             const String &password) {
   if (!name.length() || name.length() > 32 ||
       (password.length() && (password.length() < 8 || password.length() > 63)))
     return false;
@@ -1036,7 +1122,8 @@ static void controlAccessPoint() {
   const bool persistent = action == "enable" || action == "disable";
   const bool stopping = action == "stop" || action == "disable";
   if (stopping && (!networkReady() || server.client().localIP() != ETH.localIP())) {
-    server.send(409, "text/plain", "Open Admin through the Ethernet address to stop the access point.");
+    server.send(409, "text/plain",
+                "Open Admin through the Ethernet address to stop the access point.");
     return;
   }
   if (action == "restart") {
@@ -1073,11 +1160,13 @@ static void controlAccessPoint() {
   apEnabled = !stopping;
   apRestartPending = action == "restart";
   apChangeAt = millis() + 700;
-  server.send(200, "text/plain", persistent
-              ? (apStartsOnBoot ? "Wi-Fi AP enabled at startup." : "Wi-Fi AP disabled at startup.")
-              : stopping ? "Stopping Wi-Fi access point." :
-              action == "start" ? "Starting Wi-Fi access point." :
-              "Settings saved. Reconnect to Wi-Fi after the access point restarts.");
+  server.send(
+      200, "text/plain",
+      persistent
+          ? (apStartsOnBoot ? "Wi-Fi AP enabled at startup." : "Wi-Fi AP disabled at startup.")
+      : stopping          ? "Stopping Wi-Fi access point."
+      : action == "start" ? "Starting Wi-Fi access point."
+                          : "Settings saved. Reconnect to Wi-Fi after the access point restarts.");
 }
 
 static void applySettings(const std::function<String(const char *)> &setting, bool restoring) {
@@ -1088,28 +1177,34 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
   }
   NetworkSettings next = networkSettings;
   const String hostname = setting("hostname"), apName = setting("apName"),
-               apPassword = setting("apPassword"),
-               ipMode = setting("ipMode");
+               apPassword = setting("apPassword"), ipMode = setting("ipMode");
   const String channel = setting("apChannel"), width = setting("apWidth");
   if (!validHostname(hostname) || !updateApSettings(next, apName, apPassword) ||
       (channel.length() && !validApChannel(channel)) ||
-      (width.length() && width != "20" && width != "40") || (ipMode != "dhcp" && ipMode != "static")) {
-    server.send(400, "text/plain", "Check the hostname, Ethernet mode, Wi-Fi name, password and channel.");
+      (width.length() && width != "20" && width != "40") ||
+      (ipMode != "dhcp" && ipMode != "static")) {
+    server.send(400, "text/plain",
+                "Check the hostname, Ethernet mode, Wi-Fi name, password and channel.");
     return;
   }
   strlcpy(next.hostname, hostname.c_str(), sizeof(next.hostname));
   next.staticIP = ipMode == "static";
+  const String ip = setting("ethIP"), mask = setting("ethMask"), gateway = setting("ethGateway"),
+               dns = setting("ethDNS");
+  if (ip.length() > 15 || mask.length() > 15 || gateway.length() > 15 || dns.length() > 15) {
+    server.send(400, "text/plain", "IPv4 settings must contain at most 15 characters per field.");
+    return;
+  }
+  // Preserve the saved static profile when DHCP is selected or restored.
+  strlcpy(next.ip, ip.c_str(), sizeof(next.ip));
+  strlcpy(next.mask, mask.c_str(), sizeof(next.mask));
+  strlcpy(next.gateway, gateway.c_str(), sizeof(next.gateway));
+  strlcpy(next.dns, dns.c_str(), sizeof(next.dns));
   if (next.staticIP) {
-    const String ip = setting("ethIP"), mask = setting("ethMask"),
-                 gateway = setting("ethGateway"), dns = setting("ethDNS");
     IPAddress parsedIP, parsedMask, parsedGateway, parsedDNS;
-    strlcpy(next.ip, ip.c_str(), sizeof(next.ip));
-    strlcpy(next.mask, mask.c_str(), sizeof(next.mask));
-    strlcpy(next.gateway, gateway.c_str(), sizeof(next.gateway));
-    strlcpy(next.dns, dns.c_str(), sizeof(next.dns));
-    if (ip.length() > 15 || mask.length() > 15 || gateway.length() > 15 || dns.length() > 15 ||
-        !parseStaticNetwork(next, parsedIP, parsedMask, parsedGateway, parsedDNS)) {
-      server.send(400, "text/plain", "Enter a valid static IPv4 address, subnet mask, gateway and DNS.");
+    if (!parseStaticNetwork(next, parsedIP, parsedMask, parsedGateway, parsedDNS)) {
+      server.send(400, "text/plain",
+                  "Enter a valid static IPv4 address, subnet mask, gateway and DNS.");
       return;
     }
   }
@@ -1125,9 +1220,8 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
     if (intervalText[i] < '0' || intervalText[i] > '9')
       validInterval = false;
   uint32_t interval = intervalText.toInt();
-  String source = setting("source"), rip = setting("routerIP"),
-         user = setting("routerUser"), password = setting("routerPassword"),
-         portText = setting("routerPort");
+  String source = setting("source"), rip = setting("routerIP"), user = setting("routerUser"),
+         password = setting("routerPassword"), portText = setting("routerPort");
   String transport = source == "glinet" ? "ssh" : "http";
   uint32_t routerAddress = 0;
   long port = portText.toInt();
@@ -1139,8 +1233,9 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
   if ((source != "local" && source != "openwrt" && source != "glinet") ||
       (transport != "http" && transport != "ssh") || password.length() > 128 ||
       user.length() > 64 ||
-      (source != "local" && (!owIP(rip.c_str(), routerAddress) || !user.length() ||
-                             (!restoring && !(password.length() || routerPassword.length())) || !validRouter))) {
+      (source != "local" &&
+       (!owIP(rip.c_str(), routerAddress) || !user.length() ||
+        (!restoring && !(password.length() || routerPassword.length())) || !validRouter))) {
     server.send(400, "text/plain",
                 "Check scan source, OpenWrt connection, IPv4 address, port, user ID "
                 "and password.");
@@ -1161,8 +1256,7 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
   uint32_t lo, hi;
   if (!validInterval || interval < 10 || interval > 86400 || (a.length() && a.length() < 12) ||
       a.length() > 128 || a != setting("confirm") ||
-      (m != "auto" &&
-       !bounds(m, setting("subnet"), setting("start"), setting("end"), lo, hi))) {
+      (m != "auto" && !bounds(m, setting("subnet"), setting("start"), setting("end"), lo, hi))) {
     server.send(400, "text/plain",
                 "Invalid settings. Check password length, confirmation, "
                 "scan interval (10 to 86400 seconds), and scan range (maximum "
@@ -1186,36 +1280,50 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
     server.send(500, "text/plain", "Could not restore the Wi-Fi startup preference.");
     return;
   }
+  bool saved = true;
   if (setting("forgetSSH") == "yes")
-    prefs.putBool("forgetSSH", true);
-  prefs.putString("transport", transport);
-  prefs.putString("source", source);
-  prefs.putString("routerIP", rip);
-  prefs.putString("routerUser", user);
+    saved &= prefs.putBool("forgetSSH", true) == sizeof(uint8_t);
+  // Empty strings are valid for retained, unused router and range fields.
+  const auto putString = [&](const char *key, const String &value) {
+    prefs.putString(key, value);
+    return prefs.getString(key, "") == value;
+  };
+  saved &= putString("transport", transport);
+  saved &= putString("source", source);
+  saved &= putString("routerIP", rip);
+  saved &= putString("routerUser", user);
   if (password.length())
-    prefs.putString("routerPwd", password);
+    saved &= putString("routerPwd", password);
   if (validRouter)
-    prefs.putUShort("routerPort", port);
-  prefs.putString("timeZone", zone);
-  prefs.putString("timeFormat", format);
-  prefs.putString("timeServer", ntp);
-  prefs.putUInt("interval", interval);
-  prefs.putUInt("ackMinutes", minutes);
+    saved &= prefs.putUShort("routerPort", port) == sizeof(uint16_t);
+  saved &= putString("timeZone", zone);
+  saved &= putString("timeFormat", format);
+  saved &= putString("timeServer", ntp);
+  saved &= prefs.putUInt("interval", interval) == sizeof(uint32_t);
+  saved &= prefs.putUInt("ackMinutes", minutes) == sizeof(uint32_t);
   if (a.length() && prefs.putString("admin", a) != a.length()) {
     server.send(500, "text/plain", "Could not save the Admin password.");
     return;
   }
-  prefs.putString("mode", m);
-  prefs.putString("subnet", setting("subnet"));
-  prefs.putString("start", setting("start"));
-  prefs.putString("end", setting("end"));
+  saved &= putString("mode", m);
+  saved &= putString("subnet", setting("subnet"));
+  saved &= putString("start", setting("start"));
+  saved &= putString("end", setting("end"));
+  if (!saved) {
+    server.send(
+        500, "text/plain",
+        "Some settings could not be saved. Review the settings and try again before restarting.");
+    return;
+  }
   if (restoring)
     server.send(200, "text/plain", "Settings restored. Watchtower is restarting.");
   else
     server.send(200, "text/html; charset=utf-8",
-              String(ADMIN_PAGE_HEAD) + "<main class='shell'><h1>Settings saved</h1><p>Restarting. "
-                              "Reopen the dashboard on Ethernet or reconnect to the configured Wi-Fi access point.</p>"
-                              "<a href='/'>Back to dashboard</a></main></body></html>");
+                String(ADMIN_PAGE_HEAD) +
+                    "<main class='shell'><h1>Settings saved</h1><p>Restarting. "
+                    "Reopen the dashboard on Ethernet or reconnect to the configured Wi-Fi access "
+                    "point.</p>"
+                    "<a href='/'>Back to dashboard</a></main></body></html>");
   restartAt = millis() + 1500;
 }
 void save() {
@@ -1244,30 +1352,39 @@ static void restoreSettings() {
       cJSON_ParseWithOpts(backup.c_str(), nullptr, true), cJSON_Delete);
   const cJSON *version = cJSON_GetObjectItemCaseSensitive(root.get(), "version");
   if (!cJSON_IsNumber(version) || version->valuedouble != 1) {
-    server.send(400, "text/plain", "This file is not a version 1 Watchtower settings export.");
+    server.send(400, "text/plain", "The saved backup is not a version 1 Watchtower configuration.");
     return;
   }
 
-  struct ConfigField { const char *form, *section, *key; bool number; };
-  const ConfigField fields[] = {
-      {"hostname", nullptr, "hostname", false},
-      {"ipMode", "ethernet", "mode", false},
-      {"ethIP", "ethernet", "ip", false}, {"ethMask", "ethernet", "mask", false},
-      {"ethGateway", "ethernet", "gateway", false}, {"ethDNS", "ethernet", "dns", false},
-      {"apName", "accessPoint", "ssid", false},
-      {"source", "discovery", "source", false}, {"mode", "discovery", "mode", false},
-      {"subnet", "discovery", "subnet", false}, {"start", "discovery", "start", false},
-      {"end", "discovery", "end", false}, {"interval", "discovery", "intervalSeconds", true},
-      {"routerIP", "router", "ip", false}, {"routerPort", "router", "port", true},
-      {"routerUser", "router", "username", false},
-      {"timeZone", "time", "zone", false}, {"timeFormat", "time", "format", false},
-      {"timeServer", "time", "server", false}, {"ackMinutes", nullptr, "acknowledgmentMinutes", true}
+  struct ConfigField {
+    const char *form, *section, *key;
+    bool number;
   };
+  const ConfigField fields[] = {{"hostname", nullptr, "hostname", false},
+                                {"ipMode", "ethernet", "mode", false},
+                                {"ethIP", "ethernet", "ip", false},
+                                {"ethMask", "ethernet", "mask", false},
+                                {"ethGateway", "ethernet", "gateway", false},
+                                {"ethDNS", "ethernet", "dns", false},
+                                {"apName", "accessPoint", "ssid", false},
+                                {"source", "discovery", "source", false},
+                                {"mode", "discovery", "mode", false},
+                                {"subnet", "discovery", "subnet", false},
+                                {"start", "discovery", "start", false},
+                                {"end", "discovery", "end", false},
+                                {"interval", "discovery", "intervalSeconds", true},
+                                {"routerIP", "router", "ip", false},
+                                {"routerPort", "router", "port", true},
+                                {"routerUser", "router", "username", false},
+                                {"timeZone", "time", "zone", false},
+                                {"timeFormat", "time", "format", false},
+                                {"timeServer", "time", "server", false},
+                                {"ackMinutes", nullptr, "acknowledgmentMinutes", true}};
   String values[sizeof(fields) / sizeof(fields[0])];
   for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
     const auto &field = fields[i];
-    const cJSON *section = field.section ? cJSON_GetObjectItemCaseSensitive(root.get(), field.section)
-                                         : root.get();
+    const cJSON *section =
+        field.section ? cJSON_GetObjectItemCaseSensitive(root.get(), field.section) : root.get();
     const cJSON *value = cJSON_GetObjectItemCaseSensitive(section, field.key);
     if (field.number && cJSON_IsNumber(value) && value->valuedouble >= 0 &&
         value->valuedouble <= 86400 && uint32_t(value->valuedouble) == value->valuedouble)
@@ -1284,16 +1401,17 @@ static void restoreSettings() {
   String restoredChannel;
   if (savedChannel) {
     if (!cJSON_IsNumber(savedChannel) || savedChannel->valuedouble < 1 ||
-        savedChannel->valuedouble > 11 || int(savedChannel->valuedouble) != savedChannel->valuedouble) {
-      server.send(400, "text/plain", "Invalid Wi-Fi channel in the configuration file.");
+        savedChannel->valuedouble > 11 ||
+        int(savedChannel->valuedouble) != savedChannel->valuedouble) {
+      server.send(400, "text/plain", "Invalid Wi-Fi channel in the configuration backup.");
       return;
     }
     restoredChannel = String(savedChannel->valueint);
   }
   const cJSON *savedWidth = cJSON_GetObjectItemCaseSensitive(ap, "widthMHz");
   if (savedWidth && (!cJSON_IsNumber(savedWidth) ||
-      (savedWidth->valuedouble != 20 && savedWidth->valuedouble != 40))) {
-    server.send(400, "text/plain", "Invalid Wi-Fi channel width in the configuration file.");
+                     (savedWidth->valuedouble != 20 && savedWidth->valuedouble != 40))) {
+    server.send(400, "text/plain", "Invalid Wi-Fi channel width in the configuration backup.");
     return;
   }
   const cJSON *apOnBoot = cJSON_GetObjectItemCaseSensitive(ap, "enabledAtBoot");
@@ -1301,18 +1419,20 @@ static void restoreSettings() {
     server.send(400, "text/plain", "Invalid Wi-Fi startup preference in the backup.");
     return;
   }
-  applySettings([&](const char *key) -> String {
-    if (!strcmp(key, "apOnBoot"))
-      return apOnBoot ? String(cJSON_IsTrue(apOnBoot) ? "true" : "false") : String();
-    if (!strcmp(key, "apChannel"))
-      return restoredChannel;
-    if (!strcmp(key, "apWidth"))
-      return savedWidth ? String(savedWidth->valueint) : String();
-    for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
-      if (!strcmp(key, fields[i].form))
-        return values[i];
-    return "";
-  }, true);
+  applySettings(
+      [&](const char *key) -> String {
+        if (!strcmp(key, "apOnBoot"))
+          return apOnBoot ? String(cJSON_IsTrue(apOnBoot) ? "true" : "false") : String();
+        if (!strcmp(key, "apChannel"))
+          return restoredChannel;
+        if (!strcmp(key, "apWidth"))
+          return savedWidth ? String(savedWidth->valueint) : String();
+        for (unsigned i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+          if (!strcmp(key, fields[i].form))
+            return values[i];
+        return "";
+      },
+      true);
 }
 
 void printConnectionInfo() {
@@ -1333,7 +1453,8 @@ void setupAP() {
   if (lastAttempt && millis() - lastAttempt < 5000)
     return;
   lastAttempt = millis();
-  if (!WiFi.mode(WIFI_AP) || !WiFi.softAP(networkSettings.apName, networkSettings.apPassword, apChannel)) {
+  if (!WiFi.mode(WIFI_AP) ||
+      !WiFi.softAP(networkSettings.apName, networkSettings.apPassword, apChannel)) {
     Serial.println("Setup hotspot failed to start; retrying in 5 seconds.");
     return;
   }
@@ -1370,8 +1491,9 @@ static void startEthernet() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.printf("\nWatchtower - Intrusion Detection System (IDS) (ids-1) starting; reset reason: %d\n",
-                int(esp_reset_reason()));
+  Serial.printf(
+      "\nWatchtower - Intrusion Detection System (IDS) (ids-1) starting; reset reason: %d\n",
+      int(esp_reset_reason()));
   prefs.begin("esp32ids", false);
   if (prefs.getBytesLength("leds-v1") == sizeof(leds))
     prefs.getBytes("leds-v1", &leds, sizeof(leds));
@@ -1432,7 +1554,8 @@ void setup() {
   apStartsOnBoot = prefs.getBool("apOnBoot", true);
   apEnabled = apStartsOnBoot;
   apChannel = prefs.getUChar("apChannel", 1);
-  if (apChannel < 1 || apChannel > 11) apChannel = 1;
+  if (apChannel < 1 || apChannel > 11)
+    apChannel = 1;
   setupAP();
   server.on("/", HTTP_GET, dashboard);
   server.on("/api/devices", HTTP_GET, api);
@@ -1445,8 +1568,9 @@ void setup() {
             []() { gzipAsset(THEME_JS, sizeof(THEME_JS), "text/javascript; charset=utf-8"); });
   server.on("/assets/admin.js", HTTP_GET,
             []() { gzipAsset(ADMIN_JS, sizeof(ADMIN_JS), "text/javascript; charset=utf-8"); });
-  server.on("/assets/policies.js", HTTP_GET,
-            []() { gzipAsset(POLICIES_JS, sizeof(POLICIES_JS), "text/javascript; charset=utf-8"); });
+  server.on("/assets/policies.js", HTTP_GET, []() {
+    gzipAsset(POLICIES_JS, sizeof(POLICIES_JS), "text/javascript; charset=utf-8");
+  });
   server.on("/assets/timezones.json", HTTP_GET,
             []() { gzipAsset(TIMEZONES_JSON, sizeof(TIMEZONES_JSON), "application/json"); });
   server.on("/assets/dashboard.js", HTTP_GET, []() {
@@ -1459,15 +1583,36 @@ void setup() {
     if (adminRequest()) {
       wifi_bandwidth_t width;
       const int applied = apRunning && esp_wifi_get_bandwidth(WIFI_IF_AP, &width) == ESP_OK
-          ? (width == WIFI_BW_HT40 ? 40 : 20) : 0;
-      server.send(200, "application/json", String("{\"running\":") + (apRunning ? "true" : "false") +
-                  ",\"enabledAtBoot\":" + (apStartsOnBoot ? "true" : "false") +
-                  ",\"pending\":" + (apChangeAt ? "true" : "false") + ",\"channel\":" + apChannel +
-                  ",\"widthMHz\":" + applied + "}");
+                              ? (width == WIFI_BW_HT40 ? 40 : 20)
+                              : 0;
+      server.send(200, "application/json",
+                  String("{\"running\":") + (apRunning ? "true" : "false") +
+                      ",\"enabledAtBoot\":" + (apStartsOnBoot ? "true" : "false") +
+                      ",\"pending\":" + (apChangeAt ? "true" : "false") +
+                      ",\"channel\":" + apChannel + ",\"widthMHz\":" + applied + "}");
     }
   });
   server.on("/admin/devices", HTTP_POST, changeDevices);
   server.on("/admin/leds", HTTP_POST, saveLedSettings);
+  server.on("/admin/health", HTTP_GET, healthStatus);
+  server.on("/admin/reboot", HTTP_POST, []() {
+    if (!adminRequest(true))
+      return;
+    server.send(200, "text/plain", "System restarting.");
+    restartAt = millis() + 1000;
+  });
+  server.on("/admin/stealth", HTTP_POST, []() {
+    if (!adminRequest(true))
+      return;
+    LedSettings next = leds;
+    next.enabled = server.arg("enabled") == "yes";
+    if (prefs.putBytes("leds-v1", &next, sizeof(next)) != sizeof(next)) {
+      server.send(500, "text/plain", "Could not save Stealth Mode.");
+      return;
+    }
+    leds = next;
+    server.send(200, "text/plain", leds.enabled ? "Stealth Mode off." : "Stealth Mode on.");
+  });
   server.on("/admin/backup", HTTP_POST, saveConfigurationBackup);
   server.on("/admin/backup/restore", HTTP_POST, restoreSettings);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
@@ -1507,8 +1652,10 @@ static void updateStatusLed() {
       unauthorized |= policy == Unknown;
       acknowledged |= policy == Acknowledged;
     }
-    const LedState state = unauthorized ? LedUnauthorized : acknowledged ? LedAcknowledged
-        : scanning && leds.show[LedActivity] ? LedActivity : LedAuthorized;
+    const LedState state = unauthorized                         ? LedUnauthorized
+                           : acknowledged                       ? LedAcknowledged
+                           : scanning && leds.show[LedActivity] ? LedActivity
+                                                                : LedAuthorized;
     const uint32_t halfPeriod = state == LedAuthorized ? 500 : 160;
     if ((completed || state == LedActivity) && leds.show[state] && (now / halfPeriod) % 2 == 0)
       color = leds.colors[state];
@@ -1543,6 +1690,7 @@ static void serviceBootButton() {
 }
 
 void loop() {
+  sampleHealth();
   serviceBootButton();
   updateStatusLed();
   server.handleClient();

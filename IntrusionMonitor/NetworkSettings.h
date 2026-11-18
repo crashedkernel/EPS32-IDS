@@ -19,8 +19,7 @@ static bool validHostname(const String &name) {
     return false;
   for (unsigned i = 0; i < name.length(); ++i) {
     char c = name[i];
-    if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
-        !(c >= '0' && c <= '9') && c != '-')
+    if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '-')
       return false;
   }
   return true;
@@ -30,6 +29,8 @@ static bool parseStaticNetwork(const NetworkSettings &settings, IPAddress &ip, I
                                IPAddress &gateway, IPAddress &dns) {
   if (!ip.fromString(settings.ip) || !mask.fromString(settings.mask) ||
       !gateway.fromString(settings.gateway) || !dns.fromString(settings.dns))
+    return false;
+  if (ip.type() != IPv4 || mask.type() != IPv4 || gateway.type() != IPv4 || dns.type() != IPv4)
     return false;
   const uint32_t netmask = number(mask);
   const uint32_t hostmask = ~netmask;
@@ -41,6 +42,6 @@ static bool parseStaticNetwork(const NetworkSettings &settings, IPAddress &ip, I
   const uint32_t host = number(ip) & hostmask;
   const uint32_t gatewayHost = number(gateway) & hostmask;
   return unicast(ip) && unicast(gateway) && unicast(dns) &&
-         (number(ip) & netmask) == (number(gateway) & netmask) &&
-         ip != gateway && host && host != hostmask && gatewayHost && gatewayHost != hostmask;
+         (number(ip) & netmask) == (number(gateway) & netmask) && ip != gateway && host &&
+         host != hostmask && gatewayHost && gatewayHost != hostmask;
 }
