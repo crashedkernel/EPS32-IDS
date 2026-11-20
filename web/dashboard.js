@@ -54,9 +54,8 @@
 
   function matches(v) {
     const group = $('deviceGroup').value;
-    if (group !== 'all' && (v.status !== (group.startsWith('offline') ? 'OFFLINE' : 'ONLINE') ||
-        group.endsWith('-authorized') && v.policy !== 'Authorized')) return false;
     const choice = $('statusFilter').value;
+    if (!deviceSort.inGroup(v, group)) return false;
     if (choice === 'online' && v.status !== 'ONLINE' || choice === 'offline' && v.status !== 'OFFLINE' || choice === 'changed' && !v.changed || choice === 'new' && !v.isNew) return false;
     if (choice === 'authorized' && (v.status !== 'ONLINE' || v.policy !== 'Authorized')) return false;
     if (choice === 'unauthorized' && (v.status !== 'ONLINE' || v.policy === 'Authorized')) return false;
@@ -65,39 +64,14 @@
   }
 
   function renderHeatmap() {
-    const grid = $('deviceHeatmap');
-    const focused = grid.contains(document.activeElement) ? document.activeElement.dataset.mac : null;
-    grid.replaceChildren();
-    const devices = [...latest.devices].sort((a, b) => deviceSort.compare(a, b, 'ip', true));
-    $('heatmapCount').textContent = devices.length + ' tracked devices';
-    if (!devices.length) {
-      grid.textContent = latest.completed ? 'No devices discovered yet.' : 'Waiting for the first scan.';
-      return;
-    }
-    for (const device of devices) {
-      const online = device.status === 'ONLINE';
-      const state = !online ? 'offline' : device.policy === 'Authorized' ? 'online'
-        : device.policy === 'Acknowledged' ? 'ack' : 'alert';
-      const label = [device.name || device.hostname || 'Unknown device', device.ip || 'IP unavailable',
-        device.mac || 'MAC unavailable', online ? 'Online' : 'Offline', device.policy].join(' · ');
-      const tile = document.createElement('button');
-      tile.type = 'button';
-      tile.className = 'heat-tile heat-' + state;
-      tile.dataset.mac = device.mac || device.ip;
-      tile.title = label;
-      tile.setAttribute('aria-label', label);
-      tile.addEventListener('focus', () => { $('heatmapDetail').textContent = label; });
-      tile.addEventListener('mouseenter', () => { $('heatmapDetail').textContent = label; });
-      tile.addEventListener('click', () => {
-        $('deviceGroup').value = 'all';
-        $('statusFilter').value = 'all';
-        $('search').value = device.mac || device.ip || device.name || '';
-        render();
-        $('device-inventory').scrollIntoView({behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start'});
-      });
-      grid.append(tile);
-      if (focused && focused === tile.dataset.mac) tile.focus({preventScroll: true});
-    }
+    if (!$('dashboardDeviceMap').open) { $('heatmapCount').textContent = latest.devices.length + ' tracked devices'; return; }
+    watchtowerHeatmap.render(latest, device => {
+      $('deviceGroup').value = 'all';
+      $('statusFilter').value = 'all';
+      $('search').value = device.mac || device.ip || device.name || '';
+      render();
+      watchtowerScrollTo($('device-inventory'));
+    });
   }
 
   function render() {
@@ -229,13 +203,13 @@
     $('nextScan').textContent = !latest.ethernetIP ? 'Waiting for Ethernet'
       : latest.scanning || latest.scanRequested ? 'Scanning'
       : 'Next scan in ' + Math.max(0, Math.ceil(latest.nextScanSeconds - elapsed)) + ' sec';
-    $('scanAge').textContent = latest.completed ? 'Completed ' + relative(latest.age + elapsed) : 'Waiting for first scan'
+    $('scanAge').textContent = latest.completed ? 'Completed scan · ' + relative(latest.age + elapsed) : 'Waiting for first scan'
   }
 
   function scanButton() {
     const scanning = latest && (latest.scanning || latest.scanRequested);
     $('scanNow').disabled = !latest || scanning || requesting;
-    $('scanButtonLabel').textContent = scanning ? 'Scanning…' : requesting ? 'Starting…' : 'Scan now';
+    $('scanButtonLabel').textContent = scanning ? 'Scanning…' : requesting ? 'Starting…' : 'Scan Now';
     $('scanIcon').classList.toggle('spinner', Boolean(scanning || requesting))
   }
   async function refresh() {
@@ -289,10 +263,20 @@
     $('statusFilter').value = link.dataset.filter;
     $('search').value = '';
     render();
-    $('device-inventory').scrollIntoView({
-      behavior: reducedMotion() ? 'auto' : 'smooth',
-      block: 'start'
-    })
+    watchtowerScrollTo($('device-inventory'))
+  });
+  $('showAllDevices').addEventListener('click', () => {
+    $('deviceGroup').value = 'all';
+    $('statusFilter').value = 'all';
+    $('search').value = '';
+    render();
+  });
+  const map = $('dashboardDeviceMap');
+  try { map.open = localStorage.getItem('watchtower-map-open') !== 'false'; } catch (_) {}
+  map.addEventListener('toggle', () => {
+    document.documentElement.scrollTop = document.body.scrollTop = 0;
+    if (map.open && latest) renderHeatmap();
+    try { localStorage.setItem('watchtower-map-open', String(map.open)); } catch (_) {}
   });
   $('deviceGroup').addEventListener('change', render);
   $('search').addEventListener('input', render);

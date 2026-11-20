@@ -78,6 +78,7 @@ cJSON *routerCall(const String &session, const char *object, const char *method,
 }
 bool readRouterSnapshot(RouterSnapshot &snapshot, String &error) {
   if (scanSource == "glinet") {
+    RecoverySSHScope recoveryScope;
     if (!openRouterSSH(error))
       return false;
     bool ok = readRouterSSHClients(snapshot, error);

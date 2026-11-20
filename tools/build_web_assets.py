@@ -9,6 +9,7 @@ ASSETS = {
     "UI_CSS": "ui.css",
     "THEME_JS": "theme.js",
     "SORT_JS": "sort.js",
+    "HEATMAP_JS": "heatmap.js",
     "DASHBOARD_JS": "dashboard.js",
     "ADMIN_JS": "admin.js",
     "POLICIES_JS": "policies.js",

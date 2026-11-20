@@ -20,5 +20,11 @@ const deviceSort = (() => {
     button.parentElement.setAttribute('aria-sort', active ? (ascending ? 'ascending' : 'descending') : 'none');
     button.querySelector('.sort-marker').textContent = active ? (ascending ? '▲' : '▼') : '';
   }
-  return {compare, mark};
+  function inGroup(device, group) {
+    if (group === 'all') return true;
+    const [presence, policy] = group.split('-');
+    const policies = {authorized: 'Authorized', unauthorized: 'Unauthorized', acknowledged: 'Acknowledged'};
+    return device.status === presence.toUpperCase() && (!policy || device.policy === policies[policy]);
+  }
+  return {compare, mark, inGroup};
 })();

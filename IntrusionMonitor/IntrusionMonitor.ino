@@ -34,6 +34,7 @@ uint32_t scanIntervalSeconds = 60;
 WebServer server(80);
 Preferences prefs;
 String adminPassword, mode, subnet, rangeStart, rangeEnd, csrf;
+String adminRealm;
 String scanSource = "local", routerIP, routerUser, routerPassword;
 String routerTransport = "http";
 uint16_t routerPort = 80;
@@ -164,6 +165,8 @@ bool ping(uint32_t ip) {
       int n = recvfrom(fd, buf, sizeof(buf), 0, (sockaddr *)&from, &len);
       if (n < 0)
         break;
+      if (n < 20)
+        continue; // A truncated IPv4 packet has no header to inspect.
       unsigned h = (buf[0] & 15) * 4;
       if (h >= 20 && n >= int(h + 12) && from.sin_addr.s_addr == target.sin_addr.s_addr &&
           buf[h] == 0 && buf[h + 4] == packet[4] && buf[h + 5] == packet[5] && buf[h + 7] == 1) {
@@ -357,6 +360,7 @@ String reverseName(uint32_t ip, IPAddress dns, uint32_t waitMs) {
   udp.stop();
   return result;
 }
+#include "RecoveryMonitor.h"
 #include "OpenWrt.h"
 #include "NetworkSettings.h"
 #include "DevicePolicy.h"
@@ -590,10 +594,30 @@ void gzipAsset(const uint8_t *data, size_t length, const char *type) {
   server.sendHeader("Cache-Control", "no-cache");
   server.send_P(200, type, reinterpret_cast<const char *>(data), length);
 }
+#include "AdminSession.h"
 bool auth() {
-  if (server.authenticate("admin", adminPassword.c_str()))
+  server.sendHeader("Cache-Control", "no-store");
+  if (adminCookie("watchtower_logout") == "1") {
+    server.send(401, "text/html", "<p>You are logged out of Watchtower Admin.</p><a href='/admin/login'>Sign In to Admin</a>");
+    return false;
+  }
+  if (validAdminSession()) return true;
+  // Only a deliberate Admin page visit may open a browser login dialog.
+  // Concurrent polling challenges invalidate WebServer's shared nonce.
+  if (server.method() != HTTP_GET || server.uri() != "/admin") {
+    server.send(401, "text/plain", "Admin session expired. Open /admin/login to sign in.");
+    return false;
+  }
+  const String authorization = server.header("Authorization");
+  const int realmStart = authorization.indexOf("realm=\"");
+  const int realmEnd = realmStart < 0 ? -1 : authorization.indexOf('"', realmStart + 7);
+  if (authorization.startsWith("Digest ") && realmStart >= 0 && realmEnd > realmStart &&
+      authorization.substring(realmStart + 7, realmEnd) == adminRealm &&
+      server.authenticate("admin", adminPassword.c_str())) {
+    startAdminSession();
     return true;
-  server.requestAuthentication(DIGEST_AUTH, "Watchtower - Intrusion Detection System (IDS)");
+  }
+  server.requestAuthentication(DIGEST_AUTH, adminRealm.c_str());
   return false;
 }
 void dashboard() { gzipAsset(DASHBOARD_HTML, sizeof(DASHBOARD_HTML), "text/html; charset=utf-8"); }
@@ -781,8 +805,7 @@ String field(String label, String name, String value, String type = "text") {
 }
 String timeSettingsFields() {
   String p =
-      "<section class='card settings-card' id='time'><div class='section-title'><div><h2>Date "
-      "&amp; time</h2><p>Choose the clock shown to "
+      "<section class='card settings-card' id='time'><div class='section-title'><div><h2>Date &amp; Time</h2><p>Choose the clock shown to "
       "everyone viewing the dashboard.</p></div></div><div class='form-grid'><label "
       "class='field'>Time zone<select name='timeZone' id='timeZone'><option selected value='" +
       escape(timeZone) + "'>" + escape(timeZone) +
@@ -813,7 +836,6 @@ String timeSettingsFields() {
 static bool adminRequest(bool write = false) {
   if (!auth())
     return false;
-  server.sendHeader("Cache-Control", "no-store");
   if (write && server.arg("csrf") != csrf) {
     server.send(403, "text/plain", "Reload Admin and try again.");
     return false;
@@ -864,10 +886,10 @@ struct LedSettings {
 static LedSettings leds;
 
 static String ledSettingsSection() {
-  String html = "<section class='card settings-card' id='leds'><h2>LED indicators</h2>"
+  String html = "<section class='card settings-card' id='leds'><h2>LED Indicators</h2>"
                 "<p class='helper'>Control the onboard RGB indicator. The Ethernet controller "
-                "drives LINK and ACT.</p>"
-                "<button type='button' class='btn' id='stealthMode'>Toggle Stealth Mode</button><p "
+                "drives LINK and ACT; Stealth Mode controls the RGB indicator only.</p>"
+                "<button type='button' class='btn' id='stealthMode' aria-pressed='false'>Loading Stealth Mode…</button><p "
                 "id='stealthFeedback' role='status'></p><form id='ledForm'><label "
                 "class='check'><input type='checkbox' name='enabled' value='yes'";
   if (leds.enabled)
@@ -883,7 +905,7 @@ static String ledSettingsSection() {
             "<label class='field'>Color<input type='color' name='color" +
             index + "' value='" + color + "'></label></div>";
   }
-  return html + "</div><button class='btn btn-primary' type='submit'>Apply LED settings</button>"
+  return html + "</div><button class='btn btn-primary' type='submit'>Apply LED Settings</button>"
                 "<p id='ledFeedback' role='status'></p></form></section>";
 }
 
@@ -911,36 +933,35 @@ static void saveLedSettings() {
   server.send(200, "text/plain", "LED settings saved.");
 }
 
+#include "HeatmapSettings.h"
+#include "RecoverySettings.h"
+
 void admin() {
   if (!auth())
     return;
   String p;
-  if (!p.reserve(16000)) {
+  if (!p.reserve(32000)) {
     server.send(503, "text/plain", "Admin is busy. Try again shortly.");
     return;
   }
   p +=
-      String(ADMIN_PAGE_HEAD) + R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark mode</span></button><a class="btn btn-primary" href="/">Back to dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network">Ethernet</a><a href="#access-point">Wi-Fi access point</a><a href="#scan">Scan preferences</a><a href="#router">Router connection</a><a href="#acknowledgment">Acknowledgment</a><a href="#health">Health Status</a><a href="#leds">LED indicators</a><a href="#time">Date &amp; time</a><a href="#security">Admin security</a><a href="#configuration-backup">Configuration backup</a><a href="#devices">Device policies</a></nav><div><button type="button" id="rebootSystem" class="btn btn-danger">Reboot system</button><p id="rebootFeedback" role="status"></p><div class="form-title"><h2 class="configuration-title">Configuration</h2><p class="muted">Monitor settings</p><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
+      String(ADMIN_PAGE_HEAD) + R"HTML(<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/"><span class="brand-mark"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="15" y="15" width="6" height="6" rx="1.5"/><path d="M6 9v9h9M9 6h9v9"/></svg></span><div><span class="eyebrow">Administration</span><h1>Watchtower - Intrusion Detection System (IDS)</h1></div></a><div class="actions"><div class="font-controls" role="group" aria-label="Page text size"><button class="btn" type="button" data-font-step="-1" aria-label="Decrease text size">A-</button><button class="btn font-reset" type="button" data-font-reset aria-label="Reset text size to 100 percent"><span data-font-label aria-live="polite">100%</span></button><button class="btn" type="button" data-font-step="1" aria-label="Increase text size">A+</button></div><button class="btn" type="button" data-theme-toggle><svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14A8.5 8.5 0 0 1 10 3.5 8.5 8.5 0 1 0 20.5 14Z"/></svg><svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg><span class="theme-label" data-theme-label>Dark Mode</span></button><button type="button" id="rebootSystem" class="btn header-icon" title="Reboot System" aria-label="Reboot System"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 8a8 8 0 1 0 .5 7M20 3v5h-5"/></svg></button><button type="button" id="logoutAdmin" class="btn header-icon" title="Logout" aria-label="Logout"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H4v16h6m4-12 4 4-4 4m-6-4h12"/></svg></button><a class="btn btn-primary" href="/">Back to Dashboard</a></div></div></header><main class="shell"><div class="admin-layout"><nav class="settings-nav" aria-label="Settings sections"><div class="nav-label">Configuration</div><a href="#network" title="Set the hostname, DHCP, and static IP address.">Ethernet</a><a href="#access-point" title="Configure the local hotspot, channel, and startup behavior.">Wi-Fi Access Point</a><a href="#system-recovery" title="Enable automatic recovery for a stalled application or SSH operation.">System Recovery</a><a href="#scan" title="Choose device discovery options and scan frequency.">Scan Preferences</a><a href="#router" title="Connect to your router for live device information.">Router Connection</a><a href="#acknowledgment" title="Set how long device acknowledgments last.">Acknowledgment</a><a href="#health" title="View CPU, memory, and internal storage usage.">Health Status</a><a href="#leds" title="Set RGB status colors and Stealth Mode.">LED Indicators</a><a href="#time" title="Set the time zone, clock format, and time server.">Date &amp; Time</a><a href="#security" title="Change the Admin login password.">Admin Security</a><a href="#configuration-backup" title="Save or restore settings in internal storage.">Configuration Backup</a><a href="#admin-heatmap" title="View device policies and connection types at a glance.">Device Map</a><a href="#devices" title="Authorize devices, acknowledge alerts, and manage history.">Device Policies</a></nav><div><div id="adminSessionAlert" class="alert" role="status" hidden></div><p id="rebootFeedback" role="status"></p><div class="form-title"><h2 class="configuration-title">Configuration</h2><p class="muted">Monitor settings</p><p>Changes are saved to your device and applied after a restart.</p></div>)HTML";
   p +=
-      R"HTML(<section class='card settings-card' id='devices'><div class='section-title'><div>
-      <h2>Device policies</h2><p>Manage discovered devices and clear the observed history.</p></div></div>
-      <label class='field'>Device group<select id='adminDeviceGroup'>
-        <option value='all'>All devices</option><option value='online'>Online</option>
-        <option value='online-authorized'>Online authorized</option><option value='offline'>Offline</option>
-        <option value='offline-authorized'>Offline authorized</option>
-      </select></label>
+      R"HTML(<section class="card heatmap-card settings-card" id="admin-heatmap" aria-labelledby="heatmapTitle"><div class="heatmap-heading"><h2 id="heatmapTitle">Device Map</h2><span id="heatmapCount" class="muted"></span></div><div class="heatmap-legend"><span><i class="heat-online"></i>Authorized Online</span><span><i class="heat-alert"></i>Unauthorized Online</span><span><i class="heat-ack"></i>Acknowledged Online</span><span><i class="heat-offline"></i>Offline</span><span><i class="heat-unused"></i>Unused Port</span></div><div class="switch-caption"><span>256 DEVICE PORTS</span><span>32 × 8 · Wi-Fi / Ethernet · Select a Port for Details</span></div><div id="deviceHeatmap" class="device-heatmap" aria-label="256 device ports; unused ports are dark gray"></div><p id="heatmapDetail" class="helper" role="status">Select a tile to find its device in the inventory.</p>)HTML" + heatmapSettingsForm() + R"HTML(</section><section class='card settings-card' id='devices'><div class='section-title'><div>
+      <h2>Device Policies</h2><p>Manage discovered devices and clear the observed history.</p></div></div>
+      <label class='field'>Device group<select id='adminDeviceGroup'><option value="all">All Devices</option><option value="online">Online</option><option value="online-authorized">Online Authorized</option><option value="online-unauthorized">Online Unauthorized</option><option value="online-acknowledged">Online Acknowledged</option><option value="offline">Offline</option><option value="offline-authorized">Offline Authorized</option><option value="offline-unauthorized">Offline Unauthorized</option><option value="offline-acknowledged">Offline Acknowledged</option></select></label>
       <label class='field device-search'>Search devices<input id='deviceSearch' type='search' placeholder='Hostname, IP, MAC, presence or policy'></label>
       <div class='device-selection'>
-        <button type='button' id='selectAllDevices' class='btn' disabled>Select all shown</button>
-        <button type='button' id='selectNoDevices' class='btn' disabled>Select none</button>
-        <button type='button' id='authorizeSelected' class='btn btn-primary' disabled>Authorize selected</button>
-        <button type='button' id='deauthorizeSelected' class='btn' disabled>Deauthorize selected</button>
+        <button type='button' id='selectAllDevices' class='btn' disabled>Select All Shown</button>
+        <button type='button' id='selectNoDevices' class='btn' disabled>Select None</button>
+        <button type='button' id='authorizeSelected' class='btn btn-primary' disabled>Authorize Selected</button>
+        <button type='button' id='deauthorizeSelected' class='btn' disabled>Deauthorize Selected</button>
         <button type='button' id='clearSelectedDevices' class='btn btn-danger' disabled>Clear Selected Devices from History</button>
         <span id='deviceSelectionCount' role='status'>0 selected</span>
       </div>
       <div id='adminDevices' data-token=')HTML" +
       csrf + R"HTML('></div>
-      <button type='button' id='acknowledgeAllDevices' class='btn btn-primary'>Acknowledge all online</button>
+      <button type='button' id='acknowledgeAllDevices' class='btn btn-primary'>Acknowledge All Online</button>
       <button type='button' id='clearDevices' class='btn btn-danger'>Clear All Device History</button>
       <p id='deviceFeedback' class='helper' role='status'></p></section>
       <section class='card settings-card' id='health'><h2>Health Status</h2>
@@ -949,16 +970,16 @@ void admin() {
         </div><p id='healthError' class='helper' role='status' hidden></p>
       </section>
       <section class='card settings-card' id='configuration-backup'>
-        <h2>Configuration backup</h2>
-        <p class='helper'>Save the active settings to internal flash. Each backup replaces the previous one. Passwords and device policies are excluded.</p>
+        <h2>Configuration Backup</h2>
+        <p class='helper'>Save the active settings to internal flash. Each backup replaces the previous one. Passwords, device policies, LED, Device Map, and recovery preferences are excluded.</p>
         <div class='device-selection'>
-          <button type='button' id='saveBackup' class='btn btn-primary'>Save configuration</button>
-          <button type='button' id='restoreBackup' class='btn'>Restore saved configuration</button>
+          <button type='button' id='saveBackup' class='btn btn-primary'>Save Configuration</button>
+          <button type='button' id='restoreBackup' class='btn'>Restore Saved Configuration &amp; Reboot Board</button>
         </div>
         <p id='backupStatus' role='status'></p>
       </section>
       )HTML" +
-      ledSettingsSection() + R"HTML(
+      recoverySettingsSection() + ledSettingsSection() + R"HTML(
       <form method='post' action='/admin' id='settingsForm'><input type='hidden' name='csrf' value=")HTML" +
       csrf +
       R"HTML("><section class='card settings-card' id='network'><h2>Ethernet</h2><div class='form-grid'>)HTML";
@@ -976,7 +997,7 @@ void admin() {
        field("Default gateway", "ethGateway", networkSettings.gateway) +
        field("DNS server", "ethDNS", networkSettings.dns) +
        "</div></section><section class='card settings-card' id='access-point'>"
-       "<h2>Wi-Fi access point</h2><div class='form-grid'>" +
+       "<h2>Wi-Fi Access Point</h2><div class='form-grid'>" +
        field("Network name (SSID)", "apName", networkSettings.apName) +
        field("New Wi-Fi password", "apPassword", "", "password") +
        "<label class='field'>Radio band<select disabled><option>2.4 GHz</option>"
@@ -998,14 +1019,14 @@ void admin() {
        "<div class='device-selection'><button type='button' class='btn' id='apStart'>Start "
        "AP</button>"
        "<button type='button' class='btn' id='apStop'>Stop AP</button>"
-       "<button type='button' class='btn btn-primary' id='apRestart'>Save and restart "
+       "<button type='button' class='btn btn-primary' id='apRestart'>Save and Restart "
        "AP</button></div>"
        "<button type='button' class='btn' id='apPersistent' data-enabled='" +
-       String(apStartsOnBoot ? "true'>Disable AP persistently" : "false'>Enable AP persistently") +
+       String(apStartsOnBoot ? "true'>Disable AP Persistently" : "false'>Enable AP Persistently") +
        "</button><p id='apStatus' role='status'>" + String(apRunning ? "Running" : "Stopped") +
        "</p>" +
        "</section><section class='card settings-card' "
-       "id='scan'><div class='section-title'><div><h2>Scan preferences</h2><p>Choose "
+       "id='scan'><div class='section-title'><div><h2>Scan Preferences</h2><p>Choose "
        "where to look for devices and how often to update.</p></div></div><div "
        "class='form-grid'><label class='field'>Discovery source<select "
        "name='source' id='source'>";
@@ -1034,7 +1055,7 @@ void admin() {
        "for one-minute updates. GL.iNet mode imports the complete router client list; subnet/range "
        "filters apply only to other sources. The dashboard's Scan now button requests an "
        "additional scan.</p></section><section class='card settings-card' "
-       "id='router'><div class='section-title'><div><h2>Router connection</h2><p>Use "
+       "id='router'><div class='section-title'><div><h2>Router Connection</h2><p>Use "
        "your existing OpenWrt login to retrieve device "
        "records.</p></div></div><p class='helper' id='localSourceNote'>These "
        "settings are retained when local discovery is selected.</p><div "
@@ -1069,7 +1090,7 @@ void admin() {
        "restart.</p></section>" +
        timeSettingsFields() +
        "<section class='card settings-card' "
-       "id='security'><div class='section-title'><div><h2>Admin security</h2><p>Update "
+       "id='security'><div class='section-title'><div><h2>Admin Security</h2><p>Update "
        "the password used to sign in to this settings "
        "page.</p></div></div><div class='form-grid'>" +
        field("New admin password", "admin", "", "password") +
@@ -1078,11 +1099,11 @@ void admin() {
        "blank to keep the current password. Your username is "
        "admin.</p></section><div class='card savebar'><p>Saving restarts the "
        "monitor and clears observed sessions. Saved device policies are kept.</p><button "
-       "type='submit' class='btn btn-primary' id='saveButton'>Save settings "
-       "&amp; restart</button></div></form>";
+       "type='submit' class='btn btn-primary' id='saveButton'>Save Settings "
+       "&amp; Restart</button></div></form>";
   p += "</div></div><footer class='page-footer'><span>Watchtower - Intrusion Detection System "
        "(IDS) / Administration</span>"
-       "</footer></main><script defer src='/assets/sort.js'></script><script defer "
+       "</footer></main><script defer src='/assets/sort.js'></script><script defer src='/assets/heatmap.js'></script><script defer "
        "src='/assets/admin.js'></script><script defer "
        "src='/assets/policies.js'></script></body></html>";
   server.sendHeader("Cache-Control", "no-store");
@@ -1323,7 +1344,7 @@ static void applySettings(const std::function<String(const char *)> &setting, bo
                     "<main class='shell'><h1>Settings saved</h1><p>Restarting. "
                     "Reopen the dashboard on Ethernet or reconnect to the configured Wi-Fi access "
                     "point.</p>"
-                    "<a href='/'>Back to dashboard</a></main></body></html>");
+                    "<a href='/'>Back to Dashboard</a></main></body></html>");
   restartAt = millis() + 1500;
 }
 void save() {
@@ -1436,6 +1457,9 @@ static void restoreSettings() {
 }
 
 void printConnectionInfo() {
+  Serial.printf("Memory: free=%u minimum=%u largest=%u\n",
+                static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMinFreeHeap()),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
   Serial.println("\nWatchtower - Intrusion Detection System (IDS) (ids-1) | Serial: 115200 baud | "
                  "send ? to repeat");
   if (apRunning)
@@ -1495,8 +1519,19 @@ void setup() {
       "\nWatchtower - Intrusion Detection System (IDS) (ids-1) starting; reset reason: %d\n",
       int(esp_reset_reason()));
   prefs.begin("esp32ids", false);
+  // Retire the removed notification feature's saved settings and credentials.
+  nvs_handle_t retiredNotifications;
+  if (nvs_open("ids-email", NVS_READONLY, &retiredNotifications) == ESP_OK) {
+    nvs_close(retiredNotifications);
+    if (nvs_open("ids-email", NVS_READWRITE, &retiredNotifications) == ESP_OK) {
+      if (nvs_erase_all(retiredNotifications) != ESP_OK || nvs_commit(retiredNotifications) != ESP_OK)
+        Serial.println("Could not clear retired notification settings.");
+      nvs_close(retiredNotifications);
+    }
+  }
   if (prefs.getBytesLength("leds-v1") == sizeof(leds))
     prefs.getBytes("leds-v1", &leds, sizeof(leds));
+  loadHeatmapSettings();
   adminPassword = prefs.getString("admin", defaultPassword);
   if (!adminPassword.length())
     adminPassword = defaultPassword;
@@ -1505,6 +1540,7 @@ void setup() {
   for (const char *key : {"botToken", "botChat"})
     if (prefs.isKey(key))
       prefs.remove(key);
+  adminRealm = "Watchtower Admin " + String(esp_random(), HEX);
   csrf = String(esp_random(), HEX) + String(esp_random(), HEX);
   scanSource = prefs.getString("source", "local");
   if (scanSource != "openwrt" && scanSource != "glinet")
@@ -1573,10 +1609,30 @@ void setup() {
   });
   server.on("/assets/timezones.json", HTTP_GET,
             []() { gzipAsset(TIMEZONES_JSON, sizeof(TIMEZONES_JSON), "application/json"); });
+  server.on("/assets/heatmap.js", HTTP_GET, []() {
+    gzipAsset(HEATMAP_JS, sizeof(HEATMAP_JS), "text/javascript; charset=utf-8");
+  });
   server.on("/assets/dashboard.js", HTTP_GET, []() {
     gzipAsset(DASHBOARD_JS, sizeof(DASHBOARD_JS), "text/javascript; charset=utf-8");
   });
+  server.on("/api/heatmap", HTTP_GET, []() {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(200, "application/json", heatmapJson());
+  });
+  server.on("/admin/heatmap", HTTP_POST, saveHeatmapSettings);
   server.on("/admin", HTTP_GET, admin);
+  server.on("/admin/login", HTTP_GET, []() {
+    server.sendHeader("Set-Cookie", "watchtower_logout=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("Location", "/admin");
+    server.send(303, "text/plain", "Sign in to Watchtower Admin.");
+  });
+  server.on("/admin/logout", HTTP_POST, []() {
+    if (!adminRequest(true)) return;
+    endAdminSession();
+    server.sendHeader("Set-Cookie", "watchtower_logout=1; Path=/; HttpOnly; SameSite=Strict");
+    server.send(200, "text/plain", "Logged out.");
+  });
   server.on("/admin", HTTP_POST, save);
   server.on("/admin/ap", HTTP_POST, controlAccessPoint);
   server.on("/admin/ap", HTTP_GET, []() {
@@ -1594,7 +1650,14 @@ void setup() {
   });
   server.on("/admin/devices", HTTP_POST, changeDevices);
   server.on("/admin/leds", HTTP_POST, saveLedSettings);
+  server.on("/admin/leds", HTTP_GET, []() {
+    if (adminRequest())
+      server.send(200, "application/json",
+                  String("{\"enabled\":") + (leds.enabled ? "true" : "false") + "}");
+  });
   server.on("/admin/health", HTTP_GET, healthStatus);
+  server.on("/admin/recovery", HTTP_GET, recoveryStatus);
+  server.on("/admin/recovery", HTTP_POST, saveRecoverySettings);
   server.on("/admin/reboot", HTTP_POST, []() {
     if (!adminRequest(true))
       return;
@@ -1605,17 +1668,26 @@ void setup() {
     if (!adminRequest(true))
       return;
     LedSettings next = leds;
-    next.enabled = server.arg("enabled") == "yes";
+    if (server.arg("action") == "toggle")
+      next.enabled = !leds.enabled;
+    else if (server.arg("enabled") == "yes" || server.arg("enabled") == "no")
+      next.enabled = server.arg("enabled") == "yes";
+    else {
+      server.send(400, "text/plain", "Choose a valid Stealth Mode action.");
+      return;
+    }
     if (prefs.putBytes("leds-v1", &next, sizeof(next)) != sizeof(next)) {
       server.send(500, "text/plain", "Could not save Stealth Mode.");
       return;
     }
     leds = next;
-    server.send(200, "text/plain", leds.enabled ? "Stealth Mode off." : "Stealth Mode on.");
+    server.send(200, "application/json", String("{\"enabled\":") + (leds.enabled ? "true" : "false") + "}");
   });
   server.on("/admin/backup", HTTP_POST, saveConfigurationBackup);
   server.on("/admin/backup/restore", HTTP_POST, restoreSettings);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  const char *requestHeaders[] = {"Cookie"};
+  server.collectHeaders(requestHeaders, 1);
   server.begin();
   if (prefs.getBool("forgetSSH", false)) {
     Preferences trust;
@@ -1625,6 +1697,7 @@ void setup() {
       trust.end();
     }
   }
+  setupRecovery();
   if (scanSource == "glinet")
     libssh_begin();
   unsigned stackSize = scanSource == "glinet" ? 51200 : 24576;
@@ -1734,5 +1807,6 @@ void loop() {
     MDNS.end();
     advertised = false;
   }
+  recoveryLoopBeat();
   delay(2);
 }

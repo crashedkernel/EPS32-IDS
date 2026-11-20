@@ -40,6 +40,8 @@ static void healthStatus() {
       200, "application/json",
       String("{\"cpu\":") + cpuUse + ",\"clockMHz\":" + ESP.getCpuFreqMHz() +
           ",\"heapTotal\":" + ESP.getHeapSize() + ",\"heapFree\":" + ESP.getFreeHeap() +
+          ",\"heapMinimum\":" + ESP.getMinFreeHeap() +
+          ",\"heapLargest\":" + heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) +
           ",\"flashTotal\":" + ESP.getFlashChipSize() + ",\"firmwareUsed\":" + ESP.getSketchSize() +
           ",\"storageTotal\":" + (storageKnown ? storage->size : 0) + ",\"storageUsedPercent\":" +
           (storageKnown ? 100.0f * stats.used_entries / stats.total_entries : -1) + "}");

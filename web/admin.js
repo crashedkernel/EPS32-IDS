@@ -2,6 +2,64 @@
   'use strict';
   const $ = id => document.getElementById(id);
 
+  async function adminFetch(url, options) {
+    const response = await fetch(url, options);
+    if (response.status === 401) {
+      const banner = $('adminSessionAlert');
+      const link = document.createElement('a');
+      link.href = '/admin/login'; link.textContent = 'Sign In';
+      banner.replaceChildren(document.createTextNode('Your Admin session has expired. '), link);
+      banner.hidden = false;
+    } else if (response.ok) $('adminSessionAlert').hidden = true;
+    return response;
+  }
+  for (const input of document.querySelectorAll('[data-heat-speed]')) input.addEventListener('input', () => {
+    document.querySelector('[data-heat-output="' + input.dataset.heatSpeed + '"]').textContent = (Number(input.value) / 10).toFixed(1) + ' flashes/s';
+  });
+  $('heatmapForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = event.target.querySelector('button[type=submit]');
+    button.disabled = true;
+    try {
+      const body = new URLSearchParams(new FormData(event.target));
+      body.set('csrf', $('settingsForm').elements.csrf.value);
+      const response = await adminFetch('/admin/heatmap', {method: 'POST', body});
+      if (!response.ok) throw Error(await response.text());
+      watchtowerHeatmap.configure(await response.json());
+      $('heatmapFeedback').textContent = 'Device Map settings saved for both pages.';
+    } catch (error) { $('heatmapFeedback').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  async function recoveryStatus() {
+    try {
+      const response = await adminFetch('/admin/recovery', {cache: 'no-store'});
+      if (!response.ok) throw Error('Recovery status is unavailable.');
+      const state = await response.json();
+      $('recoveryStatus').textContent = !state.enabled ? 'Automatic recovery is disabled.'
+        : state.paused ? 'Recovery is paused after repeated restarts. Save enabled settings to resume.'
+        : !state.ready ? 'Recovery monitor could not start. Retry or restart the system.'
+        : state.graceSeconds ? 'Startup grace: ' + state.graceSeconds + ' seconds remaining.'
+        : 'Monitoring the application and SSH operations.';
+      if (state.lastRecovery !== 'None recorded') $('recoveryStatus').textContent += ' Last recovery: ' + state.lastRecovery + '.';
+      if (state.enabled && state.sshBusy) $('recoveryStatus').textContent += ' SSH operation active for ' + state.sshAgeSeconds + ' seconds.';
+    } catch (error) { $('recoveryStatus').textContent = error.message; }
+  }
+  $('recoveryForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = event.target.querySelector('button[type=submit]');button.disabled = true;
+    try {
+      const body = new URLSearchParams(new FormData(event.target));body.set('csrf', $('settingsForm').elements.csrf.value);
+      const response = await adminFetch('/admin/recovery', {method:'POST', body});
+      const message = await response.text();
+      if (!response.ok) throw Error(message);
+      $('recoveryFeedback').textContent = message;
+      await recoveryStatus();
+    } catch (error) { $('recoveryFeedback').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  recoveryStatus();
+  setInterval(recoveryStatus, 5000);
+
   function addressFields() {
     $('subnetFields').hidden = $('mode').value !== 'subnet';
     $('rangeFields').hidden = $('mode').value !== 'range';
@@ -72,7 +130,7 @@
   })();
   async function refreshAp() {
     try {
-      const response = await fetch('/admin/ap', {cache: 'no-store'});
+      const response = await adminFetch('/admin/ap', {cache: 'no-store'});
       if (!response.ok) return;
       const state = await response.json();
       if (state.pending) return;
@@ -81,7 +139,7 @@
         : 'Stopped';
       $('apStatus').textContent += state.enabledAtBoot ? ' · Enabled at startup' : ' · Disabled at startup';
       $('apPersistent').dataset.enabled = String(state.enabledAtBoot);
-      $('apPersistent').textContent = state.enabledAtBoot ? 'Disable AP persistently' : 'Enable AP persistently';
+      $('apPersistent').textContent = state.enabledAtBoot ? 'Disable AP Persistently' : 'Enable AP Persistently';
       $('apStart').disabled = state.running;
       $('apStop').disabled = !state.running;
     } catch {
@@ -103,7 +161,7 @@
       }
       $(id).disabled = true;
       try {
-        const response = await fetch('/admin/ap', {method: 'POST', body});
+        const response = await adminFetch('/admin/ap', {method: 'POST', body});
         $('apStatus').textContent = await response.text();
         if (response.ok && action === 'restart') form.elements.apPassword.value = '';
         setTimeout(refreshAp, 1800);
@@ -123,7 +181,7 @@
       let restarting = false;
       try {
         const body = new URLSearchParams({csrf: $('settingsForm').elements.csrf.value});
-        const response = await fetch(route, {method: 'POST', body});
+        const response = await adminFetch(route, {method: 'POST', body});
         $('backupStatus').textContent = await response.text();
         restarting = restore && response.ok;
       } catch {
@@ -141,10 +199,13 @@
     try {
       const body = new URLSearchParams(new FormData(form));
       body.set('csrf', $('settingsForm').elements.csrf.value);
-      const response = await fetch('/admin/leds', {method: 'POST', body});
-      $('ledFeedback').textContent = await response.text();
-    } catch {
-      $('ledFeedback').textContent = 'Could not reach Watchtower.';
+      const response = await adminFetch('/admin/leds', {method: 'POST', body});
+      const message = await response.text();
+      if (!response.ok) throw Error(message);
+      $('ledFeedback').textContent = message;
+      await syncStealth();
+    } catch (error) {
+      $('ledFeedback').textContent = error.message || 'Could not reach Watchtower.';
     } finally {
       button.disabled = false;
     }
@@ -154,23 +215,51 @@
     nav.append(link);
   async function adminAction(route, fields = {}) {
     const body = new URLSearchParams({csrf: $('settingsForm').elements.csrf.value, ...fields});
-    const response = await fetch(route, {method: 'POST', body});
+    const response = await adminFetch(route, {method: 'POST', body});
     const text = await response.text();
     if (!response.ok) throw Error(text);
     return text;
   }
+  $('logoutAdmin').addEventListener('click', async () => {
+    const button = $('logoutAdmin');
+    button.disabled = true;
+    try {
+      await adminAction('/admin/logout');
+      location.replace('/');
+    } catch (error) { $('rebootFeedback').textContent = error.message; button.disabled = false; }
+  });
   $('rebootSystem').addEventListener('click', async () => {
     if (!confirm('Reboot Watchtower now?')) return;
     try { $('rebootFeedback').textContent = await adminAction('/admin/reboot'); }
     catch (error) { $('rebootFeedback').textContent = error.message; }
   });
+  function showStealth(enabled) {
+    const button = $('stealthMode');
+    button.dataset.enabled = String(enabled);
+    button.setAttribute('aria-pressed', String(!enabled));
+    button.textContent = enabled ? 'Turn Stealth Mode On' : 'Turn Stealth Mode Off';
+    $('ledForm').elements.namedItem('enabled').checked = enabled;
+  }
+  async function syncStealth() {
+    const response = await adminFetch('/admin/leds', {cache: 'no-store'});
+    if (!response.ok) throw Error('Could not read the current LED state.');
+    const state = await response.json();
+    showStealth(state.enabled);
+  }
   $('stealthMode').addEventListener('click', async () => {
-    const enabled = !$('ledForm').elements.enabled.checked;
+    const button = $('stealthMode');
+    button.disabled = true;
     try {
-      $('stealthFeedback').textContent = await adminAction('/admin/stealth', {enabled: enabled ? 'yes' : 'no'});
-      $('ledForm').elements.enabled.checked = enabled;
+      const body = new URLSearchParams({csrf: $('settingsForm').elements.csrf.value, action: 'toggle'});
+      const response = await adminFetch('/admin/stealth', {method: 'POST', body});
+      if (!response.ok) throw Error(await response.text());
+      const state = await response.json();
+      showStealth(state.enabled);
+      $('stealthFeedback').textContent = state.enabled ? 'Stealth Mode off. Configured RGB patterns are enabled.' : 'Stealth Mode on. RGB indicator is off.';
     } catch (error) { $('stealthFeedback').textContent = error.message; }
+    finally { button.disabled = false; }
   });
+  syncStealth().catch(error => { $('stealthFeedback').textContent = error.message; $('stealthMode').textContent = 'Toggle Stealth Mode'; });
   function capacity(bytes) {
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / 1048576).toFixed(2) + ' MB';
@@ -200,7 +289,7 @@
     if (healthLoading) return;
     healthLoading = true;
     try {
-      const response = await fetch('/admin/health', {cache: 'no-store'});
+      const response = await adminFetch('/admin/health', {cache: 'no-store'});
       if (!response.ok) throw Error('Health information unavailable');
       const h = await response.json();
       const memory = 100 * (1 - h.heapFree / h.heapTotal);
@@ -209,6 +298,11 @@
       const cpu = healthCard('CPU', h.cpu, h.clockMHz + ' MHz clock');
       const ram = healthCard('Memory', memory,
         capacity(h.heapTotal - h.heapFree) + ' used · ' + capacity(h.heapFree) + ' available');
+      if (Number.isFinite(h.heapMinimum) && Number.isFinite(h.heapLargest)) {
+        const diagnostic = document.createElement('small');
+        diagnostic.textContent = 'Lowest free since restart: ' + capacity(h.heapMinimum) + ' · Largest free block: ' + capacity(h.heapLargest);
+        ram.append(diagnostic);
+      }
       const firmware = healthCard('Firmware flash', flash,
         capacity(h.firmwareUsed) + ' firmware · ' + capacity(h.flashTotal) + ' total flash');
       const note = document.createElement('small');
@@ -234,6 +328,6 @@
   setInterval(health, 5000);
   $('settingsForm').addEventListener('submit', () => {
     $('saveButton').disabled = true;
-    $('saveButton').textContent = 'Saving settings…'
+    $('saveButton').textContent = 'Saving Settings…'
   });
 })();

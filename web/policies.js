@@ -85,8 +85,14 @@
       if (!response.ok) throw new Error('Device list unavailable.');
       const report = await response.json();
       if (busy) return;
-      const next = JSON.stringify(report.devices.map(d => [d.mac, d.ip, d.name, d.hostname, d.status, d.policy, d.policyAvailable, d.canAcknowledge]));
+      const next = JSON.stringify([report.completed, report.ethernetIP, report.devices.map(d => [d.mac, d.ip, d.name, d.hostname, d.status, d.policy, d.policyAvailable, d.canAcknowledge])]);
       if (next === signature) return;
+      watchtowerHeatmap.render(report, device => {
+        document.getElementById('adminDeviceGroup').value = 'all';
+        search.value = device.mac || device.ip || device.name || '';
+        render();
+        watchtowerScrollTo(panel);
+      });
       signature = next;
       rows = report.devices;
       const available = new Set(rows.filter(device => device.policyAvailable).map(device => device.mac));
@@ -103,8 +109,7 @@
     const terms = search.value.trim().toLowerCase().split(/\s+/);
     const group = document.getElementById('adminDeviceGroup').value;
     const devices = rows.filter(d => {
-      if (group !== 'all' && (d.status !== (group.startsWith('offline') ? 'OFFLINE' : 'ONLINE') ||
-          group.endsWith('-authorized') && d.policy !== 'Authorized')) return false;
+      if (!deviceSort.inGroup(d, group)) return false;
       const text = [d.name || 'Unknown', d.hostname, d.ip, d.mac, d.status, d.policy].join(' ').toLowerCase();
       return terms.every(term => text.includes(term));
     }).sort((a, b) => deviceSort.compare(a, b, sortKey, ascending));
@@ -117,6 +122,8 @@
     }
     const scroller = document.createElement('div');
     scroller.className = 'table-scroll device-table';
+    scroller.tabIndex = 0;
+    scroller.setAttribute('aria-label', 'Device policies. Scroll horizontally for additional columns.');
     const table = document.createElement('table');
     const header = table.createTHead().insertRow();
     const selectHeader = document.createElement('th');
@@ -124,11 +131,12 @@
     selectHeader.className = 'selection-column';
     selectHeader.textContent = 'Select';
     header.append(selectHeader);
-    const labels = ['Device name', 'DNS name', 'IP address', 'MAC address', 'Presence', 'Policy', 'Actions'];
-    const keys = ['name', 'hostname', 'ip', 'mac', 'presence', 'policy', 'actions'];
+    const labels = ['Device Name', 'Policy', 'Presence', 'IP Address', 'DNS Name', 'MAC Address', 'Actions'];
+    const keys = ['name', 'policy', 'presence', 'ip', 'hostname', 'mac', 'actions'];
     for (const [index, label] of labels.entries()) {
       const th = document.createElement('th');
       th.scope = 'col';
+      th.className = 'col-' + keys[index];
       const button = document.createElement('button');
       button.type = 'button';
       button.dataset.key = keys[index];
@@ -166,12 +174,17 @@
         });
         selection.append(checkbox);
       }
-      [d.name || 'Unknown', d.hostname || '—', d.ip || '—', d.mac || '—', d.status, d.policy].forEach((value, i) => {
+      [d.name || 'Unknown', d.policy, d.status, d.ip || '—', d.hostname || '—', d.mac || '—'].forEach((value, i) => {
         const cell = row.insertCell();
         cell.dataset.label = labels[i];
-        cell.textContent = value;
-        if (i === 5) cell.className = d.policy === 'Authorized' ? 'authorized'
-          : d.policy === 'Acknowledged' ? 'acknowledged' : 'unauthorized';
+        cell.title = value;
+        cell.className = 'col-' + keys[i];
+        if (i === 1) {
+          const badge = document.createElement('span');
+          badge.className = 'badge ' + (d.policy === 'Authorized' ? 'authorized' : d.policy === 'Acknowledged' ? 'acknowledged' : 'unauthorized');
+          badge.textContent = value;
+          cell.append(badge);
+        } else cell.textContent = value;
       });
       const cell = row.insertCell();
       cell.dataset.label = 'Actions';
@@ -183,7 +196,7 @@
       const actions = d.policy === 'Authorized'
         ? [['reset', 'Deauthorize']]
         : [['allow', 'Authorize'], ['acknowledge', 'Acknowledge']];
-      if (d.policy === 'Acknowledged') actions.push(['reset', 'Clear acknowledgment']);
+      if (d.policy === 'Acknowledged') actions.push(['reset', 'Clear Acknowledgment']);
       for (const [action, label] of actions) {
         if (action === 'acknowledge' && !d.canAcknowledge) continue;
         const button = document.createElement('button');

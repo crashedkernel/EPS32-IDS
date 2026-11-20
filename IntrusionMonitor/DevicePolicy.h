@@ -87,7 +87,7 @@ static void updateDevice(Device &device, const Device *previous, uint32_t now, u
   const bool wasOnline = previous && previous->online;
   device.changed = previous && wasOnline != device.online;
   device.isNew = !previous && device.online;
-  device.policy = previous ? previous->policy : storedPolicy(device.mac);
+  device.policy = previous ? previous->policy : static_cast<uint8_t>(storedPolicy(device.mac));
   device.ackUntil = previous ? previous->ackUntil : 0;
   device.connectedAt = previous ? previous->connectedAt : 0;
   device.lastSeen = previous ? previous->lastSeen : 0;
